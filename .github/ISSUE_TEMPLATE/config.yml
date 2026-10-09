@@ -1,0 +1,14 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Building and installing KB-RPCS3
+    url: https://github.com/kamb205/KB-RPCS3/blob/main/BUILDING.md
+    about: How to build from source and install a build on your own console.
+  - name: Known issues and limitations
+    url: https://github.com/kamb205/KB-RPCS3/blob/main/KNOWN_ISSUES.md
+    about: Read this before filing a bug — it may already be documented.
+  - name: Licence and binary availability
+    url: https://github.com/kamb205/KB-RPCS3/blob/main/LICENSING_STATUS.md
+    about: Why there is no downloadable PS5 package yet.
+  - name: Upstream RPCS3 issues
+    url: https://github.com/RPCS3/rpcs3/issues
+    about: Problems with the emulator core itself usually belong upstream, not here.

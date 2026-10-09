@@ -1,0 +1,50 @@
+name: Feature request
+description: Suggest an improvement to KB-RPCS3.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the suggestion. Please keep in mind the project is an alpha, ships
+        source only, and works within the licences of the components it builds on — some
+        ideas may not be possible. See [ROADMAP.md](https://github.com/kamb205/KB-RPCS3/blob/main/ROADMAP.md).
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: Describe the need or frustration, not just the solution.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+    validations:
+      required: false
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Scope
+      options:
+        - Compatibility / emulation
+        - Performance
+        - PS5 title UI or features
+        - Building / tooling
+        - Documentation
+        - Other
+    validations:
+      required: true
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: Confirmations
+      options:
+        - label: This request does not require distributing Sony content or an unlawfully combined binary.
+          required: true

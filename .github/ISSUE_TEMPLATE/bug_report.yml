@@ -1,0 +1,89 @@
+name: Bug report
+description: Report a problem with KB-RPCS3 (source, build, tools or the PS5 title).
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a problem.
+
+        **Before you continue:**
+        - This is an **alpha, source-only** project — there is no downloadable PS5
+          package. Please read the [README](https://github.com/kamb205/KB-RPCS3#readme)
+          and [KNOWN_ISSUES.md](https://github.com/kamb205/KB-RPCS3/blob/main/KNOWN_ISSUES.md).
+        - Do **not** include firmware, games, keys or other Sony content.
+        - Security problems go through
+          [SECURITY.md](https://github.com/kamb205/KB-RPCS3/blob/main/SECURITY.md), not here.
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: A clear description of the problem and its impact.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Exact steps. If a game is involved, name it and its serial.
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - PS5 title (running a game or the app)
+        - Building from source
+        - Console tools / scripts
+        - Documentation
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: source
+    attributes:
+      label: Source or build
+      description: Tag/commit, or the source archive you built from.
+      placeholder: e.g. v0.1.0-alpha
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: If a console was involved, give the details you used. Do not paste secrets.
+      placeholder: |
+        PS5 model / firmware:
+        Enabler (etaHEN version):
+        kstuff:
+        Title loader (ShadowMountPlus version):
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs, screenshots or evidence
+      description: Paste relevant logs or attach files. Remove anything personal first.
+    validations:
+      required: false
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: Confirmations
+      options:
+        - label: I read KNOWN_ISSUES.md and this is not already documented.
+          required: true
+        - label: I have not included Sony firmware, games, keys or other restricted content.
+          required: true
