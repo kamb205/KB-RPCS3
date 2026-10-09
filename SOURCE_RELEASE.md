@@ -11,7 +11,10 @@
 | `port/*.sh`, `port/*.py` | build helper scripts | GPL-3.0-or-later |
 | `app/` | the PS5 title shell | see `app/LICENSING.md` |
 | `tools/` | console helper payloads and scripts, standalone TLS probes | per file header |
+| `assets/branding/` | original KB-RPCS3 logo, banner, social-preview and release artwork, with SVG sources and render script | GPL-3.0-or-later |
+| `.github/` | issue and pull-request templates | — |
 | `LICENSES/`, `COPYING` | licence texts | — |
+| root `*.md` | documentation (`README`, `BUILDING`, `INSTALL`, `LICENSING_STATUS`, `KNOWN_ISSUES`, `COMPATIBILITY`, `THIRD_PARTY_NOTICES`, `CONTRIBUTING`, `SECURITY`, `CODE_OF_CONDUCT`, `ROADMAP`, `PERMISSION_REQUESTS`, `ROLLBACK`, release notes, this file) | — |
 
 ## The RPCS3 patch series
 
@@ -33,3 +36,12 @@
   command and builds cleanly. The complete Alpha 0.1.0 source has **not** been rebuilt end to end.
 - No patch or file contains personal names, e-mail addresses, home-directory paths or private network
   addresses. Archive entries carry neutral owner names.
+
+## Presentation update (2026-10-09)
+
+Repository presentation was added on top of the source release: the README, the community files
+(`CONTRIBUTING.md`, `SECURITY.md`, `CODE_OF_CONDUCT.md`, `ROADMAP.md`), the `.github/` templates and the
+original `assets/branding/` artwork. These are documentation, configuration and graphics only — **no
+patch, source or build input changed**, so the patch-series verification above still holds. The
+distribution archive is regenerated from the `v0.1.0-alpha` tag after these changes, and its SHA-256 is
+published with the release.
