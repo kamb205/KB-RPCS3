@@ -1,0 +1,106 @@
+From bd5686ed1a808966f15483bf8dc7788e570549b9 Mon Sep 17 00:00:00 2001
+From: KB <kb@kb-rpcs3.example>
+Date: Tue, 6 Oct 2026 22:27:45 +0100
+Subject: [PATCH 32/47] PS5: DualSense rumble (pad handler apply_pad_data ->
+ title pad_vibrate)
+
+---
+ rpcs3/ps5/ps5_frontend.cpp    |  6 ++++++
+ rpcs3/ps5/ps5_frontend.h      |  2 ++
+ rpcs3/ps5/ps5_pad_handler.cpp | 23 ++++++++++++++++++++++-
+ rpcs3/ps5/ps5_pad_handler.h   |  5 +++++
+ 4 files changed, 35 insertions(+), 1 deletion(-)
+
+diff --git a/rpcs3/ps5/ps5_frontend.cpp b/rpcs3/ps5/ps5_frontend.cpp
+index 65d36e7ee..098b155cb 100644
+--- a/rpcs3/ps5/ps5_frontend.cpp
++++ b/rpcs3/ps5/ps5_frontend.cpp
+@@ -252,6 +252,12 @@ void rpcs3ps5_read_host_pad(rpcs3ps5_pad* pad)
+ 		*pad = {};
+ }
+ 
++void rpcs3ps5_set_host_vibration(u8 large, u8 small)
++{
++	if (g_host.vibrate)
++		g_host.vibrate(large, small);
++}
++
+ void rpcs3ps5_load_text_mirror(const char* path); // ps5_text_mirror.cpp
+ 
+ // rpcs3.cpp's and rpcs3qt's, which the PS5 build does not have
+diff --git a/rpcs3/ps5/ps5_frontend.h b/rpcs3/ps5/ps5_frontend.h
+index 9bab8beab..e24fbc5f5 100644
+--- a/rpcs3/ps5/ps5_frontend.h
++++ b/rpcs3/ps5/ps5_frontend.h
+@@ -52,6 +52,8 @@ struct rpcs3ps5_host
+ 	// thread of its own for each block. false when there is none.
+ 	bool (*audio_start)(void (*fill)(int16_t *frames, int count, void *user), void *user);
+ 	void (*audio_stop)(void);
++	// The pad's rumble: large and small motor, 0..255 each (0, 0 stops it)
++	void (*vibrate)(uint8_t large, uint8_t small);
+ };
+ 
+ // Once, before anything else: RPCS3's data under `root` (e.g. "/app0", giving /app0/rpcs3/)
+diff --git a/rpcs3/ps5/ps5_pad_handler.cpp b/rpcs3/ps5/ps5_pad_handler.cpp
+index 1eb2c721e..1a718aa2e 100644
+--- a/rpcs3/ps5/ps5_pad_handler.cpp
++++ b/rpcs3/ps5/ps5_pad_handler.cpp
+@@ -5,8 +5,9 @@
+ #include "ps5_pad_handler.h"
+ #include "ps5_frontend.h"
+ 
+-// ps5_frontend.cpp: the title's pad reader
++// ps5_frontend.cpp: the title's pad reader and rumble
+ void rpcs3ps5_read_host_pad(rpcs3ps5_pad* pad);
++void rpcs3ps5_set_host_vibration(u8 large, u8 small);
+ 
+ ps5_pad_handler::ps5_pad_handler()
+ 	: PadHandlerBase(pad_handler::dualsense)
+@@ -28,6 +29,7 @@ ps5_pad_handler::ps5_pad_handler()
+ 	trigger_min = 0;
+ 	trigger_max = 255;
+ 	b_has_config = true;
++	b_has_rumble = true;
+ 	b_has_deadzones = true;
+ 	m_name_string = "PS5 Pad #";
+ 	m_max_devices = 1;
+@@ -146,3 +148,22 @@ pad_preview_values ps5_pad_handler::get_preview_values(const std::unordered_map<
+ 		buttons[0].empty() ? 0 : ::at32(data, RSYPos) - ::at32(data, RSYNeg),
+ 	};
+ }
++
++void ps5_pad_handler::apply_pad_data(const pad_ensemble& binding)
++{
++	const auto& pad = binding.pad;
++	if (!pad)
++		return;
++
++	// The game's motor values, scaled by the pad config (rumble on/off, multipliers, swap)
++	const cfg_pad* config = binding.device ? binding.device->config : nullptr;
++	const u8 large = config ? config->get_large_motor_speed(pad->m_vibrate_motors) : pad->m_vibrate_motors[0].value;
++	const u8 small = config ? config->get_small_motor_speed(pad->m_vibrate_motors) : pad->m_vibrate_motors[1].value;
++
++	if (large != m_large_motor || small != m_small_motor)
++	{
++		m_large_motor = large;
++		m_small_motor = small;
++		rpcs3ps5_set_host_vibration(large, small);
++	}
++}
+diff --git a/rpcs3/ps5/ps5_pad_handler.h b/rpcs3/ps5/ps5_pad_handler.h
+index 4f891550a..1744bfc63 100644
+--- a/rpcs3/ps5/ps5_pad_handler.h
++++ b/rpcs3/ps5/ps5_pad_handler.h
+@@ -38,4 +38,9 @@ private:
+ 	PadHandlerBase::connection update_connection(const std::shared_ptr<PadDevice>& device) override;
+ 	std::unordered_map<u32, u16> get_button_values(const std::shared_ptr<PadDevice>& device) override;
+ 	pad_preview_values get_preview_values(const std::unordered_map<u32, u16>& data, const std::vector<std::string>& buttons) override;
++	void apply_pad_data(const pad_ensemble& binding) override;
++
++	// The motor speeds last sent to the console (sent again only when they change)
++	u8 m_large_motor = 0;
++	u8 m_small_motor = 0;
+ };
+-- 
+2.43.0
+

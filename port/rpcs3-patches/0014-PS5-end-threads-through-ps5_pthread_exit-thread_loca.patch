@@ -1,0 +1,34 @@
+From 1c938b6172cea1913ec57cc19e8bb1f3b045b19d Mon Sep 17 00:00:00 2001
+From: KB <kb@kb-rpcs3.example>
+Date: Sun, 4 Oct 2026 23:21:15 +0100
+Subject: [PATCH 14/47] PS5: end threads through ps5_pthread_exit (thread_local
+ before key destructors)
+
+---
+ Utilities/Thread.cpp | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/Utilities/Thread.cpp b/Utilities/Thread.cpp
+index 322333c11..600150a5a 100644
+--- a/Utilities/Thread.cpp
++++ b/Utilities/Thread.cpp
+@@ -101,6 +101,16 @@ DYNAMIC_IMPORT_RENAME("Kernel32.dll", SetThreadDescriptionImport, "SetThreadDesc
+ #include "util/sysinfo.hpp"
+ #include "Emu/Memory/vm_locking.h"
+ 
++#ifdef __PROSPERO__
++// PS5: a thread must end through the platform layer (PS5_PayloadSDK, ps5platform), which runs its
++// C++ thread_local destructors before libkernel's key destructors: through libkernel alone, emutls
++// freed a thread's storage first and RPCS3's first helper thread crashed in the heap's free at
++// exit (console run 5, as platform/docs/PROBE.md describes). Only this file's calls are routed:
++// ps5_pthread_exit itself ends in the system's pthread_exit.
++extern "C" [[noreturn]] void ps5_pthread_exit(void* value);
++#define pthread_exit ps5_pthread_exit
++#endif
++
+ LOG_CHANNEL(sig_log, "SIG");
+ LOG_CHANNEL(sys_log, "SYS");
+ LOG_CHANNEL(vm_log, "VM");
+-- 
+2.43.0
+

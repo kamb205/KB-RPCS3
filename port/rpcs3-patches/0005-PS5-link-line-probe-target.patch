@@ -1,0 +1,37 @@
+From 26c5b0ef9912ca484afeb8a7063962a8ef1581f2 Mon Sep 17 00:00:00 2001
+From: KB <kb@kb-rpcs3.example>
+Date: Sun, 4 Oct 2026 15:57:22 +0100
+Subject: [PATCH 05/47] PS5: link-line probe target
+
+---
+ rpcs3/CMakeLists.txt   | 4 ++++
+ rpcs3/ps5/linkline.cpp | 2 ++
+ 2 files changed, 6 insertions(+)
+ create mode 100644 rpcs3/ps5/linkline.cpp
+
+diff --git a/rpcs3/CMakeLists.txt b/rpcs3/CMakeLists.txt
+index ca54b9270..ff82a6825 100644
+--- a/rpcs3/CMakeLists.txt
++++ b/rpcs3/CMakeLists.txt
+@@ -51,6 +51,10 @@ if (PS5)
+     )
+     target_include_directories(rpcs3_ps5 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+     target_link_libraries(rpcs3_ps5 PUBLIC rpcs3_emu)
++
++    # Only its link command is read, for the archives the title links (port/rpcs3-build.sh)
++    add_executable(rpcs3_ps5_linkline EXCLUDE_FROM_ALL ps5/linkline.cpp)
++    target_link_libraries(rpcs3_ps5_linkline PRIVATE rpcs3_ps5)
+ endif()
+ 
+ if (NOT ANDROID AND NOT PS5)
+diff --git a/rpcs3/ps5/linkline.cpp b/rpcs3/ps5/linkline.cpp
+new file mode 100644
+index 000000000..bec3e072a
+--- /dev/null
++++ b/rpcs3/ps5/linkline.cpp
+@@ -0,0 +1,2 @@
++// Never linked: its link line lists every archive the PS5 title needs (port/rpcs3-build.sh)
++int main() { return 0; }
+-- 
+2.43.0
+

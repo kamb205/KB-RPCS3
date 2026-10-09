@@ -1,0 +1,88 @@
+From 8689eda0d4f142c538fd3f7af0eabb8baec8b87a Mon Sep 17 00:00:00 2001
+From: KB <kb@kb-rpcs3.example>
+Date: Sun, 4 Oct 2026 16:32:26 +0100
+Subject: [PATCH 11/47] PS5: boot log (fsync per line) for every reservation;
+ no fixed reservations below 0x10_0000_0000
+
+---
+ rpcs3/util/vm_native_ps5.cpp | 50 ++++++++++++++++++++++++++++++++++--
+ 1 file changed, 48 insertions(+), 2 deletions(-)
+
+diff --git a/rpcs3/util/vm_native_ps5.cpp b/rpcs3/util/vm_native_ps5.cpp
+index 7e48f8fc8..f8b586de2 100644
+--- a/rpcs3/util/vm_native_ps5.cpp
++++ b/rpcs3/util/vm_native_ps5.cpp
+@@ -16,10 +16,42 @@
+ #include "util/asm.hpp"
+ 
+ #include <sys/mman.h>
++#include <sys/stat.h>
++#include <fcntl.h>
+ #include <unistd.h>
++#include <cstdio>
++#include <cstdarg>
+ 
+ #include <ps5platform/shm.h>
+ 
++// A log that works from the first static constructor on (no stdio, no RPCS3 logging):
++// /app0/rpcs3/ps5-boot.log, each line written with write() and fsync() so a kernel
++// crash right after still leaves it on disk.
++extern "C" void rpcs3ps5_boot_log(const char* format, ...)
++{
++	char line[256];
++	va_list args;
++	va_start(args, format);
++	int n = vsnprintf(line, sizeof(line) - 1, format, args);
++	va_end(args);
++	if (n < 0)
++		return;
++	if (n > static_cast<int>(sizeof(line) - 2))
++		n = sizeof(line) - 2;
++	line[n++] = 10;
++	static int fd = -1;
++	if (fd < 0)
++	{
++		::mkdir("/app0/rpcs3", 0777);
++		fd = ::open("/app0/rpcs3/ps5-boot.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
++	}
++	if (fd >= 0)
++	{
++		::write(fd, line, n);
++		::fsync(fd);
++	}
++}
++
+ namespace utils
+ {
+ 	long get_page_size()
+@@ -80,11 +112,25 @@ namespace utils
+ 				return nullptr;
+ 			}
+ 
+-			return ps5_vrange_reserve_at(use_addr, size) == 0 ? use_addr : nullptr;
++			// Below 0x10_0000_0000 lie the GPU window, the view area and ranges the kernel
++			// keeps (PS5_PayloadSDK platform/docs/PROBE.md): fixed reservations go above it.
++			// vm::memory_reserve_4GiB steps upward until one is granted.
++			if (reinterpret_cast<uptr>(use_addr) < 0x1000000000ull)
++			{
++				return nullptr;
++			}
++
++			rpcs3ps5_boot_log("vm: reserve 0x%llx bytes at %p", static_cast<unsigned long long>(size), use_addr);
++			const int error = ps5_vrange_reserve_at(use_addr, size);
++			rpcs3ps5_boot_log("vm:   -> %s (0x%x)", error ? "refused" : "ok", error);
++			return error == 0 ? use_addr : nullptr;
+ 		}
+ 
+ 		void* base = nullptr;
+-		return ps5_vrange_reserve(size, nullptr, 0x10000, &base) == 0 ? base : nullptr;
++		rpcs3ps5_boot_log("vm: reserve 0x%llx bytes anywhere", static_cast<unsigned long long>(size));
++		const int error = ps5_vrange_reserve(size, nullptr, 0x10000, &base);
++		rpcs3ps5_boot_log("vm:   -> %p (0x%x)", base, error);
++		return error == 0 ? base : nullptr;
+ 	}
+ 
+ 	void memory_commit(void* pointer, usz size, protection prot)
+-- 
+2.43.0
+

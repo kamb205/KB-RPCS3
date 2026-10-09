@@ -1,0 +1,598 @@
+From 6cc42c1d9f18e2ff7872fdcfa625b3c753f1a03a Mon Sep 17 00:00:00 2001
+From: KB <kb@kb-rpcs3.example>
+Date: Sun, 4 Oct 2026 15:30:44 +0100
+Subject: [PATCH 01/47] PS5: no-Qt build, volk Vulkan, ps5platform memory
+ backend, no libusb/hidapi
+
+---
+ 3rdparty/CMakeLists.txt        |  36 ++--
+ 3rdparty/hidapi/CMakeLists.txt |   6 +-
+ rpcs3/CMakeLists.txt           |  10 +-
+ rpcs3/Emu/CMakeLists.txt       |   3 +-
+ rpcs3/Emu/Memory/vm.cpp        |   6 +-
+ rpcs3/Emu/RSX/VK/VulkanAPI.h   |   5 +
+ rpcs3/util/vm.hpp              |   3 +
+ rpcs3/util/vm_native.cpp       |   4 +
+ rpcs3/util/vm_native_ps5.cpp   | 306 +++++++++++++++++++++++++++++++++
+ 9 files changed, 361 insertions(+), 18 deletions(-)
+ create mode 100644 rpcs3/util/vm_native_ps5.cpp
+
+diff --git a/3rdparty/CMakeLists.txt b/3rdparty/CMakeLists.txt
+index b25afb883..dff6fe0dd 100644
+--- a/3rdparty/CMakeLists.txt
++++ b/3rdparty/CMakeLists.txt
+@@ -51,7 +51,11 @@ else()
+ endif()
+ 
+ # libusb
+-if(CMAKE_SYSTEM_NAME MATCHES "DragonFly|FreeBSD")
++if(PS5)
++	# PS5: no USB passthrough; headers only, functions stubbed in rpcs3/util/ps5_stubs.cpp
++	add_library(usb-1.0-shared INTERFACE)
++	target_include_directories(usb-1.0-shared SYSTEM INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/libusb/libusb/libusb)
++elseif(CMAKE_SYSTEM_NAME MATCHES "DragonFly|FreeBSD")
+ 	pkg_check_modules(LIBUSB REQUIRED IMPORTED_TARGET libusb-1.0>=1.0 )
+ 	cmake_dependent_option(USE_SYSTEM_LIBUSB "Use system libusb-1.0 as shared library" ON
+ 			"LIBUSB_FOUND" OFF)
+@@ -60,7 +64,9 @@ else()
+ 	cmake_dependent_option(USE_SYSTEM_LIBUSB "Use system libusb-1.0 as shared library" OFF
+ 			"LIBUSB_FOUND" OFF)
+ endif()
+-if(CMAKE_SYSTEM_NAME MATCHES "DragonFly|FreeBSD")
++if(PS5)
++	# configured above
++elseif(CMAKE_SYSTEM_NAME MATCHES "DragonFly|FreeBSD")
+ 	# Always use system libusb as reference implementation isn't supported
+ 	add_library(usb-1.0-shared INTERFACE)
+ 	target_link_libraries(usb-1.0-shared INTERFACE PkgConfig::LIBUSB)
+@@ -97,7 +103,7 @@ add_subdirectory(yaml-cpp)
+ 
+ # OpenGL
+ 
+-if (NOT ANDROID AND NOT APPLE)
++if (NOT ANDROID AND NOT PS5 AND NOT APPLE)
+ 	find_package(OpenGL REQUIRED OPTIONAL_COMPONENTS EGL)
+ 
+ 	add_library(3rdparty_opengl INTERFACE)
+@@ -155,7 +161,13 @@ endif()
+ # Vulkan
+ set(VULKAN_TARGET 3rdparty_dummy_lib)
+ if(USE_VULKAN)
+-	if(APPLE)
++	if(PS5)
++		# PS5: RADV is linked into the title; Vulkan is reached through volk (VK_NO_PROTOTYPES)
++		add_library(3rdparty_vulkan INTERFACE)
++		target_compile_definitions(3rdparty_vulkan INTERFACE -DHAVE_VULKAN -DVK_NO_PROTOTYPES)
++		target_include_directories(3rdparty_vulkan SYSTEM INTERFACE ${PS5_VULKAN_HEADERS_DIR}/include ${PS5_VOLK_DIR})
++		set(VULKAN_TARGET 3rdparty_vulkan)
++	elseif(APPLE)
+ 		if(USE_SYSTEM_MVK)
+ 			message(STATUS "RPCS3: Using system MoltenVK")
+ 		else()
+@@ -182,13 +194,17 @@ if(USE_VULKAN)
+ 		endif()
+ 	endif()
+ 
+-	find_package(Vulkan)
+-	if(VULKAN_FOUND)
++	if(NOT PS5)
++		find_package(Vulkan)
++	endif()
++	if(PS5)
++		# configured above
++	elseif(VULKAN_FOUND)
+ 		add_library(3rdparty_vulkan INTERFACE)
+ 		target_compile_definitions(3rdparty_vulkan INTERFACE -DHAVE_VULKAN)
+ 		target_link_libraries(3rdparty_vulkan INTERFACE Vulkan::Vulkan)
+ 
+-		if(UNIX AND NOT APPLE AND NOT ANDROID)
++		if(UNIX AND NOT APPLE AND NOT ANDROID AND NOT PS5)
+ 			find_package(Wayland)
+ 			if (WAYLAND_FOUND)
+ 				target_include_directories(3rdparty_vulkan
+@@ -232,7 +248,7 @@ if(USE_SDL)
+ endif()
+ 
+ # OpenAL
+-if (NOT ANDROID)
++if (NOT ANDROID AND NOT PS5)
+ 	add_subdirectory(OpenAL EXCLUDE_FROM_ALL)
+ else()
+ 	add_library(3rdparty_openal INTERFACE)
+@@ -323,7 +339,7 @@ endif()
+ 
+ # GLEW
+ add_library(3rdparty_glew INTERFACE)
+-if(NOT MSVC AND NOT ANDROID AND NOT APPLE)
++if(NOT MSVC AND NOT ANDROID AND NOT PS5 AND NOT APPLE)
+ 	find_package(GLEW REQUIRED)
+ 	target_link_libraries(3rdparty_glew INTERFACE GLEW::GLEW)
+ endif()
+@@ -354,7 +370,7 @@ add_subdirectory(fusion EXCLUDE_FROM_ALL)
+ add_subdirectory(feralinteractive EXCLUDE_FROM_ALL)
+ 
+ # add nice ALIAS targets for ease of use
+-if(USE_SYSTEM_LIBUSB)
++if(USE_SYSTEM_LIBUSB OR PS5)
+ 	add_library(3rdparty::libusb ALIAS usb-1.0-shared)
+ else()
+ 	add_library(3rdparty::libusb ALIAS usb-1.0-static)
+diff --git a/3rdparty/hidapi/CMakeLists.txt b/3rdparty/hidapi/CMakeLists.txt
+index cdaac856b..6cfeddb28 100644
+--- a/3rdparty/hidapi/CMakeLists.txt
++++ b/3rdparty/hidapi/CMakeLists.txt
+@@ -1,5 +1,9 @@
+ # hidapi
+-if(USE_SYSTEM_HIDAPI)
++if(PS5)
++	# PS5: no HID passthrough; headers only, functions stubbed in rpcs3/util/ps5_stubs.cpp
++	add_library(3rdparty_hidapi INTERFACE)
++	target_include_directories(3rdparty_hidapi SYSTEM INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/hidapi/hidapi)
++elseif(USE_SYSTEM_HIDAPI)
+ 	message(STATUS "RPCS3: using shared hidapi")
+ 	pkg_check_modules(hidapi-hidraw REQUIRED IMPORTED_TARGET hidapi-hidraw)
+ 	add_library(3rdparty_hidapi INTERFACE)
+diff --git a/rpcs3/CMakeLists.txt b/rpcs3/CMakeLists.txt
+index f53c6844b..7b42942fb 100644
+--- a/rpcs3/CMakeLists.txt
++++ b/rpcs3/CMakeLists.txt
+@@ -10,7 +10,7 @@ include(CheckFunctionExists)
+ 
+ set(CMAKE_CXX_STANDARD 23)
+ 
+-if(UNIX AND NOT APPLE AND NOT ANDROID)
++if(UNIX AND NOT APPLE AND NOT ANDROID AND NOT PS5)
+     add_compile_definitions(DATADIR="${CMAKE_INSTALL_FULL_DATADIR}/rpcs3")
+     # Optionally enable X11 for window management
+     find_package(X11)
+@@ -23,7 +23,7 @@ if(UNIX AND NOT APPLE AND NOT ANDROID)
+     endif()
+ endif()
+ 
+-if (NOT ANDROID)
++if (NOT ANDROID AND NOT PS5)
+     # Qt
+     # finds Qt libraries and setups custom commands for MOC and UIC
+     # Must be done here because generated MOC and UIC targets cant
+@@ -34,13 +34,13 @@ endif()
+ # subdirectories
+ add_subdirectory(Emu)
+ 
+-if (NOT ANDROID)
++if (NOT ANDROID AND NOT PS5)
+     add_subdirectory(rpcs3qt)
+ endif()
+ 
+ gen_git_version(${CMAKE_CURRENT_SOURCE_DIR})
+ 
+-if (NOT ANDROID)
++if (NOT ANDROID AND NOT PS5)
+     # Build rpcs3_lib
+     add_library(rpcs3_lib STATIC)
+ 
+@@ -82,7 +82,7 @@ if (NOT ANDROID)
+     # Unix display manager
+     if(X11_FOUND)
+         target_link_libraries(rpcs3_lib PRIVATE X11::X11 xkbcommon-x11)
+-    elseif(USE_VULKAN AND UNIX AND NOT WAYLAND_FOUND AND NOT APPLE AND NOT ANDROID)
++    elseif(USE_VULKAN AND UNIX AND NOT WAYLAND_FOUND AND NOT APPLE AND NOT ANDROID AND NOT PS5)
+         # Wayland has been checked in 3rdparty/CMakeLists.txt already.
+         message(FATAL_ERROR "RPCS3 requires either X11 or Wayland (or both) for Vulkan.")
+     endif()
+diff --git a/rpcs3/Emu/CMakeLists.txt b/rpcs3/Emu/CMakeLists.txt
+index 0428f0d98..2be4af1bc 100644
+--- a/rpcs3/Emu/CMakeLists.txt
++++ b/rpcs3/Emu/CMakeLists.txt
+@@ -70,6 +70,7 @@ target_sources(rpcs3_emu PRIVATE
+     ../util/logs.cpp
+     ../util/yaml.cpp
+     ../util/vm_native.cpp
++    ../util/vm_native_ps5.cpp
+     ../util/dyn_lib.cpp
+     ../util/sysinfo.cpp
+     ../util/cpu_stats.cpp
+@@ -585,7 +586,7 @@ target_sources(rpcs3_emu PRIVATE
+     RSX/Utils/rsx_utils.cpp
+ )
+ 
+-if(NOT ANDROID AND NOT APPLE)
++if(NOT ANDROID AND NOT PS5 AND NOT APPLE)
+     target_sources(rpcs3_emu PRIVATE
+         RSX/GL/GLCommonDecompiler.cpp
+         RSX/GL/GLCompute.cpp
+diff --git a/rpcs3/Emu/Memory/vm.cpp b/rpcs3/Emu/Memory/vm.cpp
+index be1d24f3c..e05d28f19 100644
+--- a/rpcs3/Emu/Memory/vm.cpp
++++ b/rpcs3/Emu/Memory/vm.cpp
+@@ -2296,7 +2296,9 @@ namespace vm
+ 
+ 	inline namespace ps3_
+ 	{
++#ifndef __PROSPERO__ // PS5: no 32 GiB sparse object; the hook range is never read
+ 		static utils::shm s_hook{0x800000000, ""};
++#endif
+ 
+ 		void init()
+ 		{
+@@ -2335,7 +2337,9 @@ namespace vm
+ #ifdef _WIN32
+ 			utils::memory_release(g_hook_addr, 0x800000000);
+ #endif
++#ifndef __PROSPERO__
+ 			ensure(s_hook.map(g_hook_addr, utils::protection::rw, true));
++#endif
+ 		}
+ 	}
+ 
+@@ -2362,7 +2366,7 @@ namespace vm
+ #ifdef _WIN32
+ 		s_hook.unmap(g_hook_addr);
+ 		ensure(utils::memory_reserve(0x800000000, g_hook_addr));
+-#else
++#elif !defined(__PROSPERO__)
+ 		utils::memory_decommit(g_hook_addr, 0x800000000);
+ #endif
+ 
+diff --git a/rpcs3/Emu/RSX/VK/VulkanAPI.h b/rpcs3/Emu/RSX/VK/VulkanAPI.h
+index 57e366c2a..d47b5c9fb 100644
+--- a/rpcs3/Emu/RSX/VK/VulkanAPI.h
++++ b/rpcs3/Emu/RSX/VK/VulkanAPI.h
+@@ -21,7 +21,12 @@
+ #pragma warning( disable : 4005 )
+ #endif
+ 
++#ifdef __PROSPERO__
++// PS5: RADV linked into the title, its commands loaded through volk
++#include <volk.h>
++#else
+ #include <vulkan/vulkan.h>
++#endif
+ 
+ #ifdef _MSC_VER
+ #pragma warning(pop)
+diff --git a/rpcs3/util/vm.hpp b/rpcs3/util/vm.hpp
+index 560823cb3..fa3e3743b 100644
+--- a/rpcs3/util/vm.hpp
++++ b/rpcs3/util/vm.hpp
+@@ -71,6 +71,9 @@ namespace utils
+ 	{
+ #ifdef _WIN32
+ 		void* m_handle{};
++#elif defined(__PROSPERO__)
++		s64 m_direct{-1}; // ps5_shm: direct memory start and size
++		u64 m_direct_bytes{};
+ #else
+ 		int m_file{};
+ #endif
+diff --git a/rpcs3/util/vm_native.cpp b/rpcs3/util/vm_native.cpp
+index 2bd422b59..c6eded9cf 100644
+--- a/rpcs3/util/vm_native.cpp
++++ b/rpcs3/util/vm_native.cpp
+@@ -1,4 +1,6 @@
+ #include "stdafx.h"
++
++#ifndef __PROSPERO__ // PS5: util/vm_native_ps5.cpp
+ #include "util/vm.hpp"
+ #include "util/asm.hpp"
+ #ifdef _WIN32
+@@ -1101,3 +1103,5 @@ namespace utils
+ 		}
+ 	}
+ } // namespace utils
++
++#endif // __PROSPERO__
+diff --git a/rpcs3/util/vm_native_ps5.cpp b/rpcs3/util/vm_native_ps5.cpp
+new file mode 100644
+index 000000000..7e48f8fc8
+--- /dev/null
++++ b/rpcs3/util/vm_native_ps5.cpp
+@@ -0,0 +1,306 @@
++// PS5 (Prospero) backend of utils' virtual memory API (util/vm.hpp).
++//
++// A title's anonymous mmap draws on its small flexible budget (~400 MiB), so every
++// reservation, commit and shared-memory object here lives in direct memory through
++// the PS5 platform layer (PS5_PayloadSDK fork, ps5platform/shm.h):
++//   memory_reserve  -> ps5_vrange_reserve(_at): address space outside the GPU window
++//   memory_commit   -> ps5_vrange_commit: 64 KiB direct units, mapped at first commit
++//   memory_decommit -> ps5_vrange_decommit (zero at the next commit)
++//   shm             -> ps5_shm_create/map: one direct allocation, any number of views
++// Execute is never granted at map time on the console; it is added by mprotect after.
++#include "stdafx.h"
++
++#ifdef __PROSPERO__
++
++#include "util/vm.hpp"
++#include "util/asm.hpp"
++
++#include <sys/mman.h>
++#include <unistd.h>
++
++#include <ps5platform/shm.h>
++
++namespace utils
++{
++	long get_page_size()
++	{
++		static const long r = []() -> long
++		{
++			const long size = ::sysconf(_SC_PAGESIZE);
++			return size > 0 ? size : 0x4000;
++		}();
++
++		return r;
++	}
++
++	static int to_posix(protection prot)
++	{
++		switch (prot)
++		{
++		case protection::rw: return PROT_READ | PROT_WRITE;
++		case protection::ro: return PROT_READ;
++		case protection::no: return PROT_NONE;
++		case protection::wx: return PROT_READ | PROT_WRITE | PROT_EXEC;
++		case protection::rx: return PROT_READ | PROT_EXEC;
++		}
++
++		return PROT_NONE;
++	}
++
++	static int to_ps5(protection prot)
++	{
++		switch (prot)
++		{
++		case protection::rw: return PS5_SHM_READ | PS5_SHM_WRITE;
++		case protection::ro: return PS5_SHM_READ;
++		case protection::no: return 0;
++		case protection::wx: return PS5_SHM_READ | PS5_SHM_WRITE | PS5_SHM_EXEC;
++		case protection::rx: return PS5_SHM_READ | PS5_SHM_EXEC;
++		}
++
++		return 0;
++	}
++
++	static void* page_floor(void* pointer, usz& size)
++	{
++		const u64 ptr64 = reinterpret_cast<u64>(pointer);
++		const u64 mask = get_page_size() - 1;
++		size += ptr64 & mask;
++		return reinterpret_cast<void*>(ptr64 & ~mask);
++	}
++
++	void* memory_reserve(usz size, void* use_addr, [[maybe_unused]] bool is_memory_mapping, [[maybe_unused]] bool can_be_jit)
++	{
++		size = utils::align(size, 0x10000);
++
++		if (use_addr)
++		{
++			if (reinterpret_cast<uptr>(use_addr) % 0x10000)
++			{
++				return nullptr;
++			}
++
++			return ps5_vrange_reserve_at(use_addr, size) == 0 ? use_addr : nullptr;
++		}
++
++		void* base = nullptr;
++		return ps5_vrange_reserve(size, nullptr, 0x10000, &base) == 0 ? base : nullptr;
++	}
++
++	void memory_commit(void* pointer, usz size, protection prot)
++	{
++		if (!size)
++		{
++			return;
++		}
++
++		ensure(ps5_vrange_commit(pointer, size, to_ps5(prot)) == 0);
++	}
++
++	void memory_decommit(void* pointer, usz size, [[maybe_unused]] bool can_be_jit)
++	{
++		if (!size)
++		{
++			return;
++		}
++
++		ensure(ps5_vrange_decommit(pointer, size) == 0);
++	}
++
++	void memory_reset(void* pointer, usz size, protection prot, [[maybe_unused]] bool can_be_jit)
++	{
++		if (!size)
++		{
++			return;
++		}
++
++		memory_decommit(pointer, size);
++		memory_commit(pointer, size, prot);
++	}
++
++	void memory_release(void* pointer, usz size)
++	{
++		if (!size)
++		{
++			return;
++		}
++
++		ensure(ps5_vrange_release(pointer, utils::align(size, 0x10000)) == 0);
++	}
++
++	void memory_protect(void* pointer, usz size, protection prot)
++	{
++		if (!size)
++		{
++			return;
++		}
++
++		void* const base = page_floor(pointer, size);
++		ensure(::mprotect(base, size, to_posix(prot)) != -1);
++	}
++
++	bool memory_lock(void*, usz)
++	{
++		// Direct memory is never paged out
++		return true;
++	}
++
++	void* memory_map_fd(native_handle, usz, protection)
++	{
++		return nullptr;
++	}
++
++	static ps5_shm as_ps5(s64 start, u64 bytes)
++	{
++		ps5_shm shm{};
++		shm.direct_start = start;
++		shm.bytes = bytes;
++		return shm;
++	}
++
++	shm::shm(u64 size, u32 flags)
++		: m_flags(flags)
++		, m_size(utils::align(size, 0x10000))
++	{
++		ps5_shm shm{};
++		const int error = ps5_shm_create(m_size, &shm);
++
++		if (error)
++		{
++			fmt::throw_exception("ps5_shm_create(0x%x) failed: 0x%x", m_size, error);
++		}
++
++		m_direct = shm.direct_start;
++		m_direct_bytes = shm.bytes;
++	}
++
++	shm::shm(u64 size, const std::string& storage)
++		: shm(size, 0u)
++	{
++		// No sparse file storage on the console: the object is direct memory
++		static_cast<void>(storage);
++	}
++
++	shm::~shm()
++	{
++		this->unmap_self();
++
++		ps5_shm shm = as_ps5(m_direct, m_direct_bytes);
++		ps5_shm_destroy(&shm);
++	}
++
++	static u8* ps5_map(s64 start, u64 bytes, u64 size, void* address, protection prot, unsigned flags)
++	{
++		const ps5_shm shm = as_ps5(start, bytes);
++
++		// Execute is refused at map time: map read-write (or no access), add it after
++		const bool exec = prot == protection::wx || prot == protection::rx;
++		const int map_prot = exec ? (PS5_SHM_READ | PS5_SHM_WRITE) : to_ps5(prot);
++
++		void* view = nullptr;
++
++		if (ps5_shm_map(&shm, 0, size, address, map_prot, flags, &view) != 0 || !view)
++		{
++			return nullptr;
++		}
++
++		if (exec && ::mprotect(view, size, to_posix(prot)) == -1)
++		{
++			ps5_shm_unmap(view, size, (flags & PS5_SHM_FIXED) ? PS5_SHM_KEEP_RESERVED : 0);
++			return nullptr;
++		}
++
++		return static_cast<u8*>(view);
++	}
++
++	u8* shm::map(void* ptr, protection prot, [[maybe_unused]] bool cow) const
++	{
++		const u64 ptr64 = reinterpret_cast<u64>(ptr) & -0x10000;
++		return ps5_map(m_direct, m_direct_bytes, m_size, reinterpret_cast<void*>(ptr64), prot, ptr64 ? PS5_SHM_FIXED : 0);
++	}
++
++	u8* shm::try_map(void* ptr, protection prot, [[maybe_unused]] bool cow) const
++	{
++		const auto target = ensure(reinterpret_cast<u8*>(reinterpret_cast<u64>(ptr) & -0x10000));
++		u8* const result = ps5_map(m_direct, m_direct_bytes, m_size, target, prot, 0);
++
++		if (result && result != target)
++		{
++			ps5_shm_unmap(result, m_size, 0);
++			return nullptr;
++		}
++
++		return result;
++	}
++
++	std::pair<u8*, std::string> shm::map_critical(void* ptr, protection prot, bool cow)
++	{
++		const auto target = reinterpret_cast<u8*>(reinterpret_cast<u64>(ptr) & -0x10000);
++		const auto mapped_addr = this->map(target, prot, cow);
++
++		if (!mapped_addr)
++		{
++			return {nullptr, "ps5_shm_map failed"};
++		}
++
++		return {mapped_addr, {}};
++	}
++
++	u8* shm::map_self(protection prot)
++	{
++		void* ptr = m_ptr;
++
++		for (void* mapped = nullptr; !ptr;)
++		{
++			if (!mapped)
++			{
++				mapped = this->map(nullptr, prot);
++
++				if (!mapped)
++				{
++					if ((ptr = m_ptr))
++					{
++						break;
++					}
++
++					return nullptr;
++				}
++			}
++
++			if (m_ptr.compare_exchange(ptr, mapped))
++			{
++				ptr = mapped;
++			}
++			else if (ptr)
++			{
++				ensure(ptr != mapped);
++				ps5_shm_unmap(mapped, m_size, 0);
++			}
++		}
++
++		return static_cast<u8*>(ptr);
++	}
++
++	void shm::unmap(void* ptr) const
++	{
++		// Views are mostly mapped inside reservations (vm, SPU LS mirrors): keep the range
++		ps5_shm_unmap(ptr, m_size, PS5_SHM_KEEP_RESERVED);
++	}
++
++	void shm::unmap_critical(void* ptr)
++	{
++		// The view goes, the range it sat in stays reserved (Linux leaves it PROT_NONE)
++		const auto target = reinterpret_cast<u8*>(reinterpret_cast<u64>(ptr) & -0x10000);
++		ensure(ps5_shm_unmap(target, m_size, PS5_SHM_KEEP_RESERVED) == 0);
++	}
++
++	void shm::unmap_self()
++	{
++		if (auto ptr = m_ptr.exchange(nullptr))
++		{
++			ps5_shm_unmap(ptr, m_size, 0);
++		}
++	}
++} // namespace utils
++
++#endif // __PROSPERO__
+-- 
+2.43.0
+

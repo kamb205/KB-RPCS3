@@ -1,0 +1,254 @@
+From 7b1e1c04579730eb5de4f938f4386920792587eb Mon Sep 17 00:00:00 2001
+From: KB <kb@kb-rpcs3.example>
+Date: Tue, 6 Oct 2026 22:14:39 +0100
+Subject: [PATCH 31/47] PS5: file writes under /app0/rpcs3/ go through an
+ unsandboxed write helper (the title process is throttled); copy out of guest
+ memory first
+
+---
+ rpcs3/Emu/Cell/lv2/sys_fs.cpp | 201 +++++++++++++++++++++++++++++++++-
+ rpcs3/Emu/Cell/lv2/sys_fs.h   |   5 +-
+ 2 files changed, 203 insertions(+), 3 deletions(-)
+
+diff --git a/rpcs3/Emu/Cell/lv2/sys_fs.cpp b/rpcs3/Emu/Cell/lv2/sys_fs.cpp
+index c37a4314a..55149816a 100644
+--- a/rpcs3/Emu/Cell/lv2/sys_fs.cpp
++++ b/rpcs3/Emu/Cell/lv2/sys_fs.cpp
+@@ -16,6 +16,15 @@
+ #include "Emu/Cell/lv2/sys_process.h"
+ 
+ #include <span>
++#ifdef __PROSPERO__
++#include <sys/socket.h>
++#include <sys/stat.h>
++#include <netinet/in.h>
++#include <netinet/tcp.h>
++#include <arpa/inet.h>
++#include <unistd.h>
++#include <thread>
++#endif
+ #include <shared_mutex>
+ 
+ LOG_CHANNEL(sys_fs);
+@@ -768,8 +777,198 @@ u64 lv2_file::op_read(const fs::file& file, vm::ptr<void> buf, u64 size, u64 opt
+ 	return result;
+ }
+ 
+-u64 lv2_file::op_write(const fs::file& file, vm::cptr<void> buf, u64 size)
++#ifdef __PROSPERO__
++// PS5: the console throttles file writes made by this (the title's) process: game data installs fell
++// from 33 MB/s to ~0.5 MB/s after ~1 GB, while an unsandboxed payload writes the same folder at a steady
++// ~42 MB/s. Writes to files under /app0/rpcs3/ therefore go to the write helper payload
++// (rpcs3ps5-io.elf, started once through the ELF loader on 127.0.0.1:9021) over 127.0.0.1:9078; the
++// helper writes the same file (checked by inode) outside the sandbox. Anything that fails falls back to
++// writing here. Data is copied out of guest memory first: write()/send() straight from the emulator's
++// memory mapping were ~2x slower.
++namespace ps5_io
+ {
++	constexpr std::string_view app_root = "/app0/rpcs3/";
++	constexpr u32 magic = 0x4f493352; // "R3IO"
++	constexpr u64 max_block = 1 << 20;
++	constexpr u16 helper_port = 9078; // 9077: the first helper (could not open the game's 0600 files)
++	u32 g_refusals = 0;
++
++	struct request
++	{
++		u32 magic;
++		u32 path_len;
++		u64 inode;
++		u64 offset;
++		u64 size;
++	};
++
++	std::mutex g_mutex;
++	int g_sock = -1;
++	bool g_launched = false;
++	u64 g_retry_after = 0;
++
++	bool send_all(int s, const void* p, usz n)
++	{
++		for (auto c = static_cast<const char*>(p); n;)
++		{
++			const ssize_t r = ::send(s, c, n, 0);
++			if (r <= 0)
++				return false;
++			c += r;
++			n -= r;
++		}
++		return true;
++	}
++
++	bool recv_all(int s, void* p, usz n)
++	{
++		for (auto c = static_cast<char*>(p); n;)
++		{
++			const ssize_t r = ::recv(s, c, n, 0);
++			if (r <= 0)
++				return false;
++			c += r;
++			n -= r;
++		}
++		return true;
++	}
++
++	int connect_to(u16 port)
++	{
++		const int s = ::socket(AF_INET, SOCK_STREAM, 0);
++		if (s < 0)
++			return -1;
++		sockaddr_in a{};
++		a.sin_family = AF_INET;
++		a.sin_port = htons(port);
++		a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
++		if (::connect(s, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0)
++		{
++			::close(s);
++			return -1;
++		}
++		return s;
++	}
++
++	// Send the helper ELF to the loader
++	void launch()
++	{
++		fs::file elf("/app0/rpcs3ps5-io.elf");
++		const int s = elf ? connect_to(9021) : -1;
++		if (s < 0)
++		{
++			sys_fs.error("PS5: write helper not started (%s)", elf ? "no ELF loader on :9021" : "/app0/rpcs3ps5-io.elf missing");
++			return;
++		}
++		const std::vector<u8> bytes = elf.to_vector<u8>();
++		send_all(s, bytes.data(), bytes.size());
++		::close(s);
++		sys_fs.notice("PS5: write helper sent to the ELF loader (%u bytes)", bytes.size());
++	}
++
++	// The helper connection, (re)connecting / starting the helper as needed; -1 when unavailable
++	int connection()
++	{
++		if (g_sock >= 0)
++			return g_sock;
++		const u64 now = get_system_time();
++		if (now < g_retry_after)
++			return -1;
++		int s = connect_to(helper_port);
++		if (s < 0 && !g_launched)
++		{
++			g_launched = true;
++			launch();
++			for (int i = 0; i < 30 && s < 0; i++)
++			{
++				std::this_thread::sleep_for(std::chrono::milliseconds(100));
++				s = connect_to(helper_port);
++			}
++		}
++		if (s < 0)
++		{
++			sys_fs.error("PS5: write helper unavailable; writing directly (throttled)");
++			g_retry_after = now + 10'000'000;
++			return -1;
++		}
++		const int one = 1;
++		::setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
++		timeval tv{10, 0};
++		::setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
++		::setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
++		sys_fs.notice("PS5: write helper connected");
++		return g_sock = s;
++	}
++
++	// Write `size` bytes at `offset` through the helper; bytes written (may be short: write the rest here)
++	u64 write(std::string_view real_path, const fs::file& file, const uchar* data, u64 offset, u64 size)
++	{
++		if (!real_path.starts_with(app_root))
++			return 0;
++		struct ::stat st{};
++		if (::fstat(file.get_handle(), &st) != 0)
++			return 0;
++		const std::string_view rel = real_path.substr(app_root.size());
++
++		thread_local std::vector<uchar> bounce(max_block);
++		std::lock_guard lock(g_mutex);
++		u64 done = 0;
++		while (done < size)
++		{
++			const int s = connection();
++			if (s < 0)
++				break;
++			const u64 block = std::min<u64>(size - done, max_block);
++			std::memcpy(bounce.data(), data + done, block);
++			const request q{magic, static_cast<u32>(rel.size()), static_cast<u64>(st.st_ino), offset + done, block};
++			s64 result = -1;
++			if (!send_all(s, &q, sizeof(q)) || !send_all(s, rel.data(), rel.size()) || !send_all(s, bounce.data(), block) || !recv_all(s, &result, sizeof(result)))
++			{
++				sys_fs.error("PS5: write helper connection lost");
++				::close(s);
++				g_sock = -1;
++				break;
++			}
++			if (result <= 0)
++			{
++				if (g_refusals++ < 5)
++					sys_fs.error("PS5: write helper refused '%s' (%d)", real_path, result);
++				break;
++			}
++			done += result;
++			if (static_cast<u64>(result) < block)
++				break;
++		}
++		return done;
++	}
++}
++#endif
++
++u64 lv2_file::op_write(const fs::file& file, vm::cptr<void> buf, u64 size, std::string_view real_path)
++{
++#ifdef __PROSPERO__
++	{
++		const auto data = static_cast<const uchar*>(buf.get_ptr());
++		const u64 pos = file.pos();
++		u64 result = ps5_io::write(real_path, file, data, pos, size);
++		if (result)
++		{
++			file.seek(pos + result);
++		}
++		// The rest (or everything, without the helper) here, through an ordinary buffer
++		thread_local std::vector<uchar> bounce(ps5_io::max_block);
++		while (result < size)
++		{
++			const u64 block = std::min<u64>(size - result, bounce.size());
++			std::memcpy(bounce.data(), data + result, block);
++			const u64 nwrite = file.write(bounce.data(), block);
++			result += nwrite;
++			if (nwrite < block)
++				break;
++		}
++		return result;
++	}
++#endif
+ 	if (u64 region = buf.addr() >> 28, region_end = (buf.addr() + size) >> 28;
+ 		size < u32{umax} && region == region_end && (region == 0 || region == 0xD) && vm::check_addr(buf.addr(), vm::page_readable, static_cast<u32>(size)))
+ 	{
+diff --git a/rpcs3/Emu/Cell/lv2/sys_fs.h b/rpcs3/Emu/Cell/lv2/sys_fs.h
+index 2c937fb0c..701f4d9cf 100644
+--- a/rpcs3/Emu/Cell/lv2/sys_fs.h
++++ b/rpcs3/Emu/Cell/lv2/sys_fs.h
+@@ -353,11 +353,12 @@ struct lv2_file final : lv2_fs_object
+ 	static void wait_read(ppu_thread& ppu, u64 end);
+ 
+ 	// File writing with intermediate buffer
+-	static u64 op_write(const fs::file& file, vm::cptr<void> buf, u64 size);
++	// (PS5: with real_path, files under /app0/rpcs3/ are written by the write helper payload)
++	static u64 op_write(const fs::file& file, vm::cptr<void> buf, u64 size, std::string_view real_path = {});
+ 
+ 	u64 op_write(vm::cptr<void> buf, u64 size) const
+ 	{
+-		return op_write(file, buf, size);
++		return op_write(file, buf, size, real_path);
+ 	}
+ 
+ 	// For MSELF support
+-- 
+2.43.0
+

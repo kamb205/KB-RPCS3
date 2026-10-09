@@ -1,0 +1,114 @@
+From a5b1da44fd39fd873950f7dd6ad063b65a7034ff Mon Sep 17 00:00:00 2001
+From: KB <kb@kb-rpcs3.example>
+Date: Thu, 8 Oct 2026 17:36:12 +0100
+Subject: [PATCH 45/47] PS5: per-frame timing in the FPS log (p50/p95/p99, 1%
+ low) for benchmarking
+
+ps5_gs_frame::flip records each frame timestamp; ps5_frontend.cpp reports the frame-time
+percentiles and the 1% low frame rate in the PS5 FPS line. Needed for the Mega vs Safe
+SPU Block Size A/B.
+---
+ rpcs3/ps5/ps5_frontend.cpp | 51 +++++++++++++++++++++++++++++++++++++-
+ rpcs3/ps5/ps5_gs_frame.h   |  3 ++-
+ 2 files changed, 52 insertions(+), 2 deletions(-)
+
+diff --git a/rpcs3/ps5/ps5_frontend.cpp b/rpcs3/ps5/ps5_frontend.cpp
+index ceab67395..d5d8b1608 100644
+--- a/rpcs3/ps5/ps5_frontend.cpp
++++ b/rpcs3/ps5/ps5_frontend.cpp
+@@ -57,6 +57,9 @@
+ #include <deque>
+ #include <mutex>
+ #include <thread>
++#include <algorithm>
++#include <numeric>
++#include <vector>
+ 
+ 
+ // The clock this thread's core runs at: a chain of dependent adds (one cycle each on Zen 2) timed with the TSC,
+@@ -372,6 +375,52 @@ std::string g_input_config_override;
+ cfg_input_configurations g_cfg_input_configs;
+ 
+ std::atomic<u64> g_ps5_flips{0};
++// Per-frame timestamps for the frame-time percentiles in the FPS log line (ps5_gs_frame::flip records here).
++namespace
++{
++constexpr usz ps5_frame_max = 16384;
++std::atomic<u64> g_ps5_frame_count{0};
++u64 g_ps5_frame_stamps[ps5_frame_max];
++u64 g_ps5_frame_reader = 0;
++}
++
++void ps5_record_frame()
++{
++	const u64 n = g_ps5_frame_count.fetch_add(1, std::memory_order_relaxed);
++	g_ps5_frame_stamps[n % ps5_frame_max] = get_system_time();
++}
++
++// Frame times (ms) of the frames since the last call: p50/p95/p99 and the 1% low frame rate
++static std::string ps5_frame_stats()
++{
++	const u64 count = g_ps5_frame_count.load(std::memory_order_relaxed);
++	u64 from = g_ps5_frame_reader;
++	if (count - from > ps5_frame_max)
++	{
++		from = count - ps5_frame_max;
++	}
++	std::vector<u64> deltas;
++	deltas.reserve(usz(count - from));
++	u64 prev = from ? g_ps5_frame_stamps[(from - 1) % ps5_frame_max] : 0;
++	for (u64 i = from; i < count; i++)
++	{
++		const u64 t = g_ps5_frame_stamps[i % ps5_frame_max];
++		if (prev && t > prev)
++		{
++			deltas.push_back(t - prev); // microseconds
++		}
++		prev = t;
++	}
++	g_ps5_frame_reader = count;
++	if (deltas.empty())
++	{
++		return "(no frames)";
++	}
++	std::sort(deltas.begin(), deltas.end());
++	const auto at = [&](double p) { return deltas[std::min<usz>(deltas.size() - 1, usz(p * deltas.size()))] / 1000.0; };
++	const double p50 = at(0.50), p95 = at(0.95), p99 = at(0.99);
++	return fmt::format("frame p50 %.2f p95 %.2f p99 %.2f ms, 1%% low %.1f fps", p50, p95, p99, p99 > 0.0 ? 1000.0 / p99 : 0.0);
++}
+ 
+ void rpcs3ps5_heartbeat(); // below: the main-thread watchdog
+ std::string ps5_thread_cpu_report(u64 window_ns, usz top); // Utilities/Thread.cpp
+@@ -870,7 +919,7 @@ void start_watchdog()
+ 				{
+ 					static u64 last_flips = 0;
+ 					const u64 flips = g_ps5_flips.load();
+-					sys_log.notice("PS5 FPS: %.1f", (flips - last_flips) * 1000.0 / window_ms);
++					sys_log.notice("PS5 FPS: %.1f | %s", (flips - last_flips) * 1000.0 / window_ms, ps5_frame_stats());
+ 					last_flips = flips;
+ 				}
+ 				sys_log.notice("PS5 CPU: %s", ps5_thread_cpu_report(window_ms * 1'000'000, 14));
+diff --git a/rpcs3/ps5/ps5_gs_frame.h b/rpcs3/ps5/ps5_gs_frame.h
+index c882c0e18..fd1eec4a2 100644
+--- a/rpcs3/ps5/ps5_gs_frame.h
++++ b/rpcs3/ps5/ps5_gs_frame.h
+@@ -7,6 +7,7 @@
+ #include <atomic>
+ 
+ extern std::atomic<u64> g_ps5_flips; // ps5_frontend.cpp
++void ps5_record_frame();             // ps5_frontend.cpp: per-frame timing for the FPS line
+ 
+ class ps5_gs_frame final : public GSFrameBase
+ {
+@@ -22,7 +23,7 @@ public:
+ 	draw_context_t make_context() override { return nullptr; }
+ 	void set_current(draw_context_t) override {}
+ 	// Frames finished, for the frame rate in RPCS3.log ("PS5 FPS", ps5_frontend.cpp)
+-	void flip(draw_context_t, bool) override { g_ps5_flips.fetch_add(1, std::memory_order_relaxed); }
++	void flip(draw_context_t, bool) override { g_ps5_flips.fetch_add(1, std::memory_order_relaxed); ps5_record_frame(); }
+ 	// The console's one display mode
+ 	int client_width() override { return 3840; }
+ 	int client_height() override { return 2160; }
+-- 
+2.43.0
+

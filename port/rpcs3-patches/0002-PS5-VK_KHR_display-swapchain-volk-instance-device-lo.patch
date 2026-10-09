@@ -1,0 +1,290 @@
+From 1122379096f6295d9ed11ae72650728a0cc52c32 Mon Sep 17 00:00:00 2001
+From: KB <kb@kb-rpcs3.example>
+Date: Sun, 4 Oct 2026 15:34:30 +0100
+Subject: [PATCH 02/47] PS5: VK_KHR_display swapchain, volk instance/device
+ loading, no GL title string, no cubeb
+
+---
+ 3rdparty/CMakeLists.txt                    |   5 +-
+ rpcs3/Emu/CMakeLists.txt                   |   9 +-
+ rpcs3/Emu/RSX/VK/vkutils/device.cpp        |   5 +
+ rpcs3/Emu/RSX/VK/vkutils/instance.cpp      |   6 +
+ rpcs3/Emu/RSX/VK/vkutils/swapchain.h       |  24 ++--
+ rpcs3/Emu/RSX/VK/vkutils/swapchain_ps5.hpp | 121 +++++++++++++++++++++
+ rpcs3/Emu/RSX/display.h                    |   2 +
+ rpcs3/Emu/title.cpp                        |   4 +-
+ 8 files changed, 160 insertions(+), 16 deletions(-)
+ create mode 100644 rpcs3/Emu/RSX/VK/vkutils/swapchain_ps5.hpp
+
+diff --git a/3rdparty/CMakeLists.txt b/3rdparty/CMakeLists.txt
+index dff6fe0dd..de867f812 100644
+--- a/3rdparty/CMakeLists.txt
++++ b/3rdparty/CMakeLists.txt
+@@ -130,7 +130,10 @@ add_subdirectory(stblib)
+ add_subdirectory(discord-rpc)
+ 
+ # Cubeb
+-if(USE_SYSTEM_CUBEB)
++if(PS5)
++	add_library(3rdparty_cubeb_dummy INTERFACE)
++	add_library(3rdparty::cubeb ALIAS 3rdparty_cubeb_dummy)
++elseif(USE_SYSTEM_CUBEB)
+ 	find_package(cubeb REQUIRED GLOBAL)
+ 	message(STATUS "Using system cubeb version '${cubeb_VERSION}'")
+ 	add_library(3rdparty::cubeb ALIAS cubeb::cubeb)
+diff --git a/rpcs3/Emu/CMakeLists.txt b/rpcs3/Emu/CMakeLists.txt
+index 2be4af1bc..1a740c3b9 100644
+--- a/rpcs3/Emu/CMakeLists.txt
++++ b/rpcs3/Emu/CMakeLists.txt
+@@ -151,10 +151,15 @@ target_sources(rpcs3_emu PRIVATE
+     Audio/audio_utils.cpp
+     Audio/AudioDumper.cpp
+     Audio/AudioBackend.cpp
+-    Audio/Cubeb/CubebBackend.cpp
+-    Audio/Cubeb/cubeb_enumerator.cpp
+ )
+ 
++if(NOT PS5) # PS5: audio through sceAudioOut (the title's backend)
++    target_sources(rpcs3_emu PRIVATE
++        Audio/Cubeb/CubebBackend.cpp
++        Audio/Cubeb/cubeb_enumerator.cpp
++    )
++endif()
++
+ if(USE_FAUDIO)
+     find_package(SDL3)
+     if(SDL3_FOUND AND SDL3_VERSION VERSION_GREATER_EQUAL 3.2.0)
+diff --git a/rpcs3/Emu/RSX/VK/vkutils/device.cpp b/rpcs3/Emu/RSX/VK/vkutils/device.cpp
+index 5926f8901..d53a7fc1d 100644
+--- a/rpcs3/Emu/RSX/VK/vkutils/device.cpp
++++ b/rpcs3/Emu/RSX/VK/vkutils/device.cpp
+@@ -847,6 +847,11 @@ namespace vk
+ 			vk::die_with_error(error);
+ 		}
+ 
++#ifdef __PROSPERO__
++		// volk: the device commands of the RADV linked into the title
++		volkLoadDevice(dev);
++#endif
++
+ 		// Dump some diagnostics to the log
+ 		rsx_log.notice("%u extensions loaded:", ::size32(requested_extensions));
+ 		for (const auto& ext : requested_extensions)
+diff --git a/rpcs3/Emu/RSX/VK/vkutils/instance.cpp b/rpcs3/Emu/RSX/VK/vkutils/instance.cpp
+index e59c24948..83b76412f 100644
+--- a/rpcs3/Emu/RSX/VK/vkutils/instance.cpp
++++ b/rpcs3/Emu/RSX/VK/vkutils/instance.cpp
+@@ -156,6 +156,8 @@ namespace vk
+ 
+ #ifdef _WIN32
+ 			extensions.push_back(VK_KHR_WIN32_SURFACE_EXTENSION_NAME);
++#elif defined(__PROSPERO__)
++			extensions.push_back(VK_KHR_DISPLAY_EXTENSION_NAME);
+ #elif defined(__APPLE__)
+ 			extensions.push_back(VK_EXT_METAL_SURFACE_EXTENSION_NAME);
+ #else
+@@ -227,6 +229,10 @@ namespace vk
+ 			return false;
+ 		}
+ 
++#ifdef __PROSPERO__
++		// volk: the instance commands of the RADV linked into the title
++		volkLoadInstance(m_instance);
++#endif
+ 		return true;
+ 	}
+ #ifdef __clang__
+diff --git a/rpcs3/Emu/RSX/VK/vkutils/swapchain.h b/rpcs3/Emu/RSX/VK/vkutils/swapchain.h
+index f5128fc48..ffd96bf9c 100644
+--- a/rpcs3/Emu/RSX/VK/vkutils/swapchain.h
++++ b/rpcs3/Emu/RSX/VK/vkutils/swapchain.h
+@@ -1,11 +1,13 @@
+-#pragma once
+-
+-#if defined (_WIN32)
+-#include "swapchain_win32.hpp"
+-#elif defined (ANDROID)
+-#include "swapchain_android.hpp"
+-#elif defined (__APPLE__)
+-#include "swapchain_macos.hpp"
+-#else // Both linux and BSD families
+-#include "swapchain_unix.hpp"
+-#endif
++#pragma once
++
++#if defined (_WIN32)
++#include "swapchain_win32.hpp"
++#elif defined (__PROSPERO__)
++#include "swapchain_ps5.hpp"
++#elif defined (ANDROID)
++#include "swapchain_android.hpp"
++#elif defined (__APPLE__)
++#include "swapchain_macos.hpp"
++#else // Both linux and BSD families
++#include "swapchain_unix.hpp"
++#endif
+diff --git a/rpcs3/Emu/RSX/VK/vkutils/swapchain_ps5.hpp b/rpcs3/Emu/RSX/VK/vkutils/swapchain_ps5.hpp
+new file mode 100644
+index 000000000..be13e1310
+--- /dev/null
++++ b/rpcs3/Emu/RSX/VK/vkutils/swapchain_ps5.hpp
+@@ -0,0 +1,121 @@
++#pragma once
++
++#include "swapchain_core.h"
++#include "util/logs.hpp"
++
++#include <vector>
++
++namespace vk
++{
++#if defined(__PROSPERO__)
++	// PS5: RADV's VK_KHR_display presents straight to the console's VideoOut.
++	// The window handle carries nothing; the surface is the display's own mode.
++	using swapchain_PS5 = native_swapchain_base;
++	using swapchain_NATIVE = swapchain_PS5;
++
++	[[maybe_unused]] static
++	VkSurfaceKHR make_WSI_surface(VkInstance vk_instance, display_handle_t /*window_handle*/, WSI_config* /*config*/)
++	{
++		u32 gpu_count = 0;
++		vkEnumeratePhysicalDevices(vk_instance, &gpu_count, nullptr);
++		if (!gpu_count)
++		{
++			rsx_log.error("PS5: no physical device for the display surface");
++			return VK_NULL_HANDLE;
++		}
++		std::vector<VkPhysicalDevice> gpus(gpu_count);
++		vkEnumeratePhysicalDevices(vk_instance, &gpu_count, gpus.data());
++		const VkPhysicalDevice gpu = gpus[0];
++
++		u32 display_count = 0;
++		vkGetPhysicalDeviceDisplayPropertiesKHR(gpu, &display_count, nullptr);
++		std::vector<VkDisplayPropertiesKHR> displays(display_count);
++		vkGetPhysicalDeviceDisplayPropertiesKHR(gpu, &display_count, displays.data());
++
++		u32 plane_count = 0;
++		vkGetPhysicalDeviceDisplayPlanePropertiesKHR(gpu, &plane_count, nullptr);
++		std::vector<VkDisplayPlanePropertiesKHR> planes(plane_count);
++		vkGetPhysicalDeviceDisplayPlanePropertiesKHR(gpu, &plane_count, planes.data());
++
++		// The console has one display and one mode (3840x2160); take the largest mode offered
++		VkDisplayKHR display = VK_NULL_HANDLE;
++		VkDisplayModePropertiesKHR best{};
++		for (const auto& properties : displays)
++		{
++			u32 mode_count = 0;
++			vkGetDisplayModePropertiesKHR(gpu, properties.display, &mode_count, nullptr);
++			std::vector<VkDisplayModePropertiesKHR> modes(mode_count);
++			vkGetDisplayModePropertiesKHR(gpu, properties.display, &mode_count, modes.data());
++			for (const auto& mode : modes)
++			{
++				const u64 area = u64{mode.parameters.visibleRegion.width} * mode.parameters.visibleRegion.height;
++				if (area > u64{best.parameters.visibleRegion.width} * best.parameters.visibleRegion.height)
++				{
++					best = mode;
++					display = properties.display;
++				}
++			}
++		}
++
++		if (display == VK_NULL_HANDLE)
++		{
++			rsx_log.error("PS5: no display mode");
++			return VK_NULL_HANDLE;
++		}
++
++		u32 plane_index = umax;
++		for (u32 i = 0; i < plane_count && plane_index == umax; i++)
++		{
++			u32 count = 0;
++			vkGetDisplayPlaneSupportedDisplaysKHR(gpu, i, &count, nullptr);
++			std::vector<VkDisplayKHR> supported(count);
++			vkGetDisplayPlaneSupportedDisplaysKHR(gpu, i, &count, supported.data());
++			for (VkDisplayKHR candidate : supported)
++			{
++				if (candidate == display)
++				{
++					plane_index = i;
++					break;
++				}
++			}
++		}
++
++		if (plane_index == umax)
++		{
++			rsx_log.error("PS5: no display plane");
++			return VK_NULL_HANDLE;
++		}
++
++		VkDisplayPlaneCapabilitiesKHR caps{};
++		vkGetDisplayPlaneCapabilitiesKHR(gpu, best.displayMode, plane_index, &caps);
++		VkDisplayPlaneAlphaFlagBitsKHR alpha = VK_DISPLAY_PLANE_ALPHA_OPAQUE_BIT_KHR;
++		if (!(caps.supportedAlpha & VK_DISPLAY_PLANE_ALPHA_OPAQUE_BIT_KHR))
++		{
++			for (auto bit : { VK_DISPLAY_PLANE_ALPHA_GLOBAL_BIT_KHR, VK_DISPLAY_PLANE_ALPHA_PER_PIXEL_BIT_KHR, VK_DISPLAY_PLANE_ALPHA_PER_PIXEL_PREMULTIPLIED_BIT_KHR })
++			{
++				if (caps.supportedAlpha & bit)
++				{
++					alpha = bit;
++					break;
++				}
++			}
++		}
++
++		VkDisplaySurfaceCreateInfoKHR info{};
++		info.sType = VK_STRUCTURE_TYPE_DISPLAY_SURFACE_CREATE_INFO_KHR;
++		info.displayMode = best.displayMode;
++		info.planeIndex = plane_index;
++		info.planeStackIndex = planes[plane_index].currentStackIndex;
++		info.transform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
++		info.globalAlpha = 1.0f;
++		info.alphaMode = alpha;
++		info.imageExtent = best.parameters.visibleRegion;
++
++		VkSurfaceKHR result = VK_NULL_HANDLE;
++		CHECK_RESULT(vkCreateDisplayPlaneSurfaceKHR(vk_instance, &info, nullptr, &result));
++		rsx_log.notice("PS5: display surface %ux%u @ %u mHz, plane %u", info.imageExtent.width, info.imageExtent.height,
++			best.parameters.refreshRate, plane_index);
++		return result;
++	}
++#endif
++}
+diff --git a/rpcs3/Emu/RSX/display.h b/rpcs3/Emu/RSX/display.h
+index 191a111e7..691d00ea1 100644
+--- a/rpcs3/Emu/RSX/display.h
++++ b/rpcs3/Emu/RSX/display.h
+@@ -17,6 +17,8 @@ using Window  = unsigned long;
+ 
+ #ifdef _WIN32
+ using display_handle_t = HWND;
++#elif defined(__PROSPERO__)
++using display_handle_t = void*; // PS5: one display, reached through VK_KHR_display
+ #elif defined(__APPLE__)
+ using display_handle_t = void*; // NSView
+ #else
+diff --git a/rpcs3/Emu/title.cpp b/rpcs3/Emu/title.cpp
+index 62306f072..ff4575be6 100644
+--- a/rpcs3/Emu/title.cpp
++++ b/rpcs3/Emu/title.cpp
+@@ -5,7 +5,7 @@
+ #include "util/sysinfo.hpp"
+ #include "Emu/system_config.h"
+ 
+-#if !(defined(__ANDROID__) || defined(__APPLE__))
++#if !(defined(__ANDROID__) || defined(__APPLE__) || defined(__PROSPERO__))
+ #include "Emu/RSX/GL/glutils/capabilities.h"
+ #endif
+ 
+@@ -84,7 +84,7 @@ namespace rpcs3
+ 						title_string += "null";
+ 						break;
+ 					case video_renderer::opengl:
+-#if !(defined(__ANDROID__) || defined(__APPLE__))
++#if !(defined(__ANDROID__) || defined(__APPLE__) || defined(__PROSPERO__))
+ 						title_string += gl::get_device_name();
+ #else
+ 						title_string += "OpenGL GPU";
+-- 
+2.43.0
+

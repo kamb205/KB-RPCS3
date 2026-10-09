@@ -1,0 +1,229 @@
+From 1db52eaa25d7e426a5cb18863f3ed5998b329f80 Mon Sep 17 00:00:00 2001
+From: KB <kb@kb-rpcs3.example>
+Date: Sun, 4 Oct 2026 15:59:31 +0100
+Subject: [PATCH 06/47] PS5: audio backend on the title output (48 kHz stereo
+ s16)
+
+---
+ rpcs3/CMakeLists.txt            |  1 +
+ rpcs3/ps5/ps5_audio_backend.cpp | 89 +++++++++++++++++++++++++++++++++
+ rpcs3/ps5/ps5_audio_backend.h   | 27 ++++++++++
+ rpcs3/ps5/ps5_frontend.cpp      | 25 ++++++++-
+ rpcs3/ps5/ps5_frontend.h        |  4 ++
+ 5 files changed, 144 insertions(+), 2 deletions(-)
+ create mode 100644 rpcs3/ps5/ps5_audio_backend.cpp
+ create mode 100644 rpcs3/ps5/ps5_audio_backend.h
+
+diff --git a/rpcs3/CMakeLists.txt b/rpcs3/CMakeLists.txt
+index ff82a6825..51613a3a9 100644
+--- a/rpcs3/CMakeLists.txt
++++ b/rpcs3/CMakeLists.txt
+@@ -45,6 +45,7 @@ if (PS5)
+     add_library(rpcs3_ps5 STATIC
+         ps5/ps5_frontend.cpp
+         ps5/ps5_pad_handler.cpp
++        ps5/ps5_audio_backend.cpp
+         Input/pad_thread.cpp
+         Input/product_info.cpp
+         rpcs3_version.cpp
+diff --git a/rpcs3/ps5/ps5_audio_backend.cpp b/rpcs3/ps5/ps5_audio_backend.cpp
+new file mode 100644
+index 000000000..01159aff0
+--- /dev/null
++++ b/rpcs3/ps5/ps5_audio_backend.cpp
+@@ -0,0 +1,89 @@
++// RPCS3 PS5 - RPCS3's audio on the console's output (ps5_audio_backend.h).
++// SPDX-License-Identifier: GPL-2.0-only
++
++#include "stdafx.h"
++#include "ps5_audio_backend.h"
++#include "ps5_frontend.h"
++
++LOG_CHANNEL(ps5_audio, "PS5Audio");
++
++// ps5_frontend.cpp: the title's audio output
++bool rpcs3ps5_host_audio_start(void (*fill)(int16_t*, int, void*), void* user);
++void rpcs3ps5_host_audio_stop();
++
++ps5_audio_backend::~ps5_audio_backend()
++{
++	Close();
++}
++
++bool ps5_audio_backend::Open(std::string_view /*dev_id*/, AudioFreq freq, AudioSampleSize sample_size, AudioChannelCnt ch_cnt, audio_channel_layout layout)
++{
++	Close();
++	std::lock_guard lock{m_cb_mutex};
++
++	m_sampling_rate = freq;
++	m_sample_size = sample_size;
++	// The console's output is stereo: RPCS3 downmixes to it
++	setup_channel_layout(static_cast<u32>(ch_cnt), 2, layout, ps5_audio);
++
++	if (get_sampling_rate() != 48000)
++		ps5_audio.warning("sampling rate %u: the output plays 48000", get_sampling_rate());
++
++	m_buffer.resize(256 * get_channels() * get_sample_size());
++	m_open = rpcs3ps5_host_audio_start(&ps5_audio_backend::fill, this);
++	if (!m_open)
++		ps5_audio.error("no audio output");
++	return m_open;
++}
++
++void ps5_audio_backend::Close()
++{
++	if (m_open)
++	{
++		rpcs3ps5_host_audio_stop();
++		m_open = false;
++	}
++	m_playing = false;
++}
++
++void ps5_audio_backend::fill(s16* frames, int count, void* user)
++{
++	auto* self = static_cast<ps5_audio_backend*>(user);
++	const u32 channels = self->get_channels();
++	const u32 frame_bytes = channels * self->get_sample_size();
++	const u32 bytes_req = static_cast<u32>(count) * frame_bytes;
++
++	std::unique_lock lock(self->m_cb_mutex, std::defer_lock);
++	u32 written = 0;
++	if (self->m_playing && self->m_write_callback && lock.try_lock_for(std::chrono::microseconds{50}))
++	{
++		if (self->m_buffer.size() < bytes_req)
++			self->m_buffer.resize(bytes_req);
++		written = std::min(self->m_write_callback(bytes_req, self->m_buffer.data()), bytes_req);
++		written -= written % frame_bytes;
++	}
++
++	const u32 got = written / frame_bytes;
++	if (self->get_convert_to_s16() || self->get_sample_size() == 2)
++	{
++		// Already 16-bit
++		const s16* src = reinterpret_cast<const s16*>(self->m_buffer.data());
++		for (u32 i = 0; i < got; i++)
++		{
++			frames[i * 2] = src[i * channels];
++			frames[i * 2 + 1] = src[i * channels + (channels > 1 ? 1 : 0)];
++		}
++	}
++	else
++	{
++		const f32* src = reinterpret_cast<const f32*>(self->m_buffer.data());
++		for (u32 i = 0; i < got; i++)
++		{
++			const f32 l = std::clamp(src[i * channels], -1.0f, 1.0f);
++			const f32 r = std::clamp(src[i * channels + (channels > 1 ? 1 : 0)], -1.0f, 1.0f);
++			frames[i * 2] = static_cast<s16>(l * 32767.0f);
++			frames[i * 2 + 1] = static_cast<s16>(r * 32767.0f);
++		}
++	}
++	std::memset(frames + got * 2, 0, (count - got) * 2 * sizeof(s16));
++}
+diff --git a/rpcs3/ps5/ps5_audio_backend.h b/rpcs3/ps5/ps5_audio_backend.h
+new file mode 100644
+index 000000000..4ca203d7d
+--- /dev/null
++++ b/rpcs3/ps5/ps5_audio_backend.h
+@@ -0,0 +1,27 @@
++// RPCS3 PS5 - RPCS3's audio on the console's output: 48 kHz stereo 16-bit, pulled by the
++// title's audio thread (rpcs3ps5_host::audio_start).
++// SPDX-License-Identifier: GPL-2.0-only
++#pragma once
++
++#include "Emu/Audio/AudioBackend.h"
++
++#include <vector>
++
++class ps5_audio_backend final : public AudioBackend
++{
++public:
++	ps5_audio_backend() = default;
++	~ps5_audio_backend() override;
++
++	std::string_view GetName() const override { return "PS5"sv; }
++	bool Open(std::string_view dev_id, AudioFreq freq, AudioSampleSize sample_size, AudioChannelCnt ch_cnt, audio_channel_layout layout) override;
++	void Close() override;
++	f64 GetCallbackFrameLen() override { return 256.0 / 48000.0; }
++	void Play() override { m_playing = true; }
++	void Pause() override { m_playing = false; }
++
++private:
++	static void fill(s16* frames, int count, void* user);
++	bool m_open = false;
++	std::vector<u8> m_buffer;
++};
+diff --git a/rpcs3/ps5/ps5_frontend.cpp b/rpcs3/ps5/ps5_frontend.cpp
+index e2352395c..df9038c08 100644
+--- a/rpcs3/ps5/ps5_frontend.cpp
++++ b/rpcs3/ps5/ps5_frontend.cpp
+@@ -7,6 +7,7 @@
+ #include "stdafx.h"
+ #include "ps5_frontend.h"
+ #include "ps5_gs_frame.h"
++#include "ps5_audio_backend.h"
+ 
+ #include "Emu/System.h"
+ #include "Emu/system_config.h"
+@@ -140,7 +141,12 @@ void create_callbacks()
+ 	};
+ 	callbacks.get_gs_frame = []() -> std::unique_ptr<GSFrameBase> { return std::make_unique<ps5_gs_frame>(); };
+ 	callbacks.close_gs_frame = []() {};
+-	callbacks.get_audio = []() -> std::shared_ptr<AudioBackend> { return std::make_shared<NullAudioBackend>(); };
++	callbacks.get_audio = []() -> std::shared_ptr<AudioBackend>
++	{
++		if (g_cfg.audio.renderer == audio_renderer::null || !g_host.audio_start)
++			return std::make_shared<NullAudioBackend>();
++		return std::make_shared<ps5_audio_backend>();
++	};
+ 	callbacks.get_audio_enumerator = [](u64) -> std::shared_ptr<audio_device_enumerator> { return std::make_shared<null_enumerator>(); };
+ 	callbacks.init_kb_handler = []() { ensure(g_fxo->init<KeyboardHandlerBase, NullKeyboardHandler>(Emu.DeserialManager())); };
+ 	callbacks.init_mouse_handler = []() { ensure(g_fxo->init<MouseHandlerBase, NullMouseHandler>(Emu.DeserialManager())); };
+@@ -195,12 +201,27 @@ void create_callbacks()
+ void apply_defaults()
+ {
+ 	g_cfg.video.renderer.set(video_renderer::vulkan);
+-	g_cfg.audio.renderer.set(audio_renderer::null);
++	// Any renderer but null is the PS5 backend (get_audio); cubeb is the default's name
++	g_cfg.audio.renderer.set(audio_renderer::cubeb);
++	g_cfg.audio.format.set(audio_format::stereo);
++	g_cfg.audio.convert_to_s16.set(true);
++	g_cfg.audio.music.set(music_handler::null);
+ 	g_cfg.core.ppu_decoder.set(ppu_decoder_type::llvm);
+ 	g_cfg.core.spu_decoder.set(spu_decoder_type::llvm);
+ }
+ } // namespace
+ 
++bool rpcs3ps5_host_audio_start(void (*fill)(int16_t*, int, void*), void* user)
++{
++	return g_host.audio_start && g_host.audio_start(fill, user);
++}
++
++void rpcs3ps5_host_audio_stop()
++{
++	if (g_host.audio_stop)
++		g_host.audio_stop();
++}
++
+ void rpcs3ps5_read_host_pad(rpcs3ps5_pad* pad)
+ {
+ 	if (g_host.read_pad)
+diff --git a/rpcs3/ps5/ps5_frontend.h b/rpcs3/ps5/ps5_frontend.h
+index 67ea99b07..f05be41b1 100644
+--- a/rpcs3/ps5/ps5_frontend.h
++++ b/rpcs3/ps5/ps5_frontend.h
+@@ -47,6 +47,10 @@ struct rpcs3ps5_host
+ 	void (*read_pad)(struct rpcs3ps5_pad *pad); // the latest pad state
+ 	void (*log)(const char *line);              // one line to klog / the title's log
+ 	void (*progress)(const char *text);         // shown while installing or booting
++	// The console's sound output: 48 kHz interleaved stereo 16-bit, `fill` called from a
++	// thread of its own for each block. false when there is none.
++	bool (*audio_start)(void (*fill)(int16_t *frames, int count, void *user), void *user);
++	void (*audio_stop)(void);
+ };
+ 
+ // Once, before anything else: RPCS3's data under `root` (e.g. "/app0", giving /app0/rpcs3/)
+-- 
+2.43.0
+

@@ -1,0 +1,31 @@
+From 15e6a6943432db74c1f50f5d66be95e61aac9bbd Mon Sep 17 00:00:00 2001
+From: KB <kb@kb-rpcs3.example>
+Date: Tue, 6 Oct 2026 11:17:50 +0100
+Subject: [PATCH 27/47] Overlay audio: no video_source means no background
+ music, not a fatal error
+
+---
+ rpcs3/Emu/RSX/Overlays/overlay_audio.cpp | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/rpcs3/Emu/RSX/Overlays/overlay_audio.cpp b/rpcs3/Emu/RSX/Overlays/overlay_audio.cpp
+index bdf22b04a..f67cecfc5 100644
+--- a/rpcs3/Emu/RSX/Overlays/overlay_audio.cpp
++++ b/rpcs3/Emu/RSX/Overlays/overlay_audio.cpp
+@@ -15,7 +15,12 @@ namespace rsx
+ 		{
+ 			if (audio_path.empty()) return;
+ 
+-			m_video_source = ensure(g_emu_callbacks.make_video_source());
++			m_video_source = g_emu_callbacks.make_video_source();
++			if (!m_video_source)
++			{
++				// No media playback in this frontend (PS5): the background music (SND0) is not played
++				return;
++			}
+ 			m_video_source->set_audio_path(audio_path, audio_in_archive);
+ 
+ 			if (audio_in_archive)
+-- 
+2.43.0
+

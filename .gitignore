@@ -1,0 +1,4 @@
+dist/
+results/
+.DS_Store
+*.o

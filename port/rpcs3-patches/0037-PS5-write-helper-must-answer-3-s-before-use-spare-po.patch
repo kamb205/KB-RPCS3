@@ -1,0 +1,121 @@
+From 1f9bcad12b2bb33b59409a252d41db26609f0fba Mon Sep 17 00:00:00 2001
+From: KB <kb@kb-rpcs3.example>
+Date: Wed, 7 Oct 2026 11:02:57 +0100
+Subject: [PATCH 37/47] PS5: write helper must answer (3 s) before use; spare
+ port 9079; a port that stops answering is not used again
+
+---
+ rpcs3/Emu/Cell/lv2/sys_fs.cpp | 60 +++++++++++++++++++++++++++++------
+ 1 file changed, 50 insertions(+), 10 deletions(-)
+
+diff --git a/rpcs3/Emu/Cell/lv2/sys_fs.cpp b/rpcs3/Emu/Cell/lv2/sys_fs.cpp
+index 55149816a..2ffd2444e 100644
+--- a/rpcs3/Emu/Cell/lv2/sys_fs.cpp
++++ b/rpcs3/Emu/Cell/lv2/sys_fs.cpp
+@@ -790,7 +790,12 @@ namespace ps5_io
+ 	constexpr std::string_view app_root = "/app0/rpcs3/";
+ 	constexpr u32 magic = 0x4f493352; // "R3IO"
+ 	constexpr u64 max_block = 1 << 20;
+-	constexpr u16 helper_port = 9078; // 9077: the first helper (could not open the game's 0600 files)
++	// 9077: the first helper (could not open the game's 0600 files). 9079: where a newer helper listens when
++	// 9078 is held by one stuck in a system call (2026-10-07: it accepted connections but never answered,
++	// and every write then waited out its timeout - the game looked frozen)
++	constexpr u16 helper_ports[] = {9078, 9079};
++	bool g_port_dead[2] = {};
++	int g_port = -1; // index of the connected port
+ 	u32 g_refusals = 0;
+ 
+ 	struct request
+@@ -866,6 +871,45 @@ namespace ps5_io
+ 		sys_fs.notice("PS5: write helper sent to the ELF loader (%u bytes)", bytes.size());
+ 	}
+ 
++	// A helper that answers on this port (its version request, within 3 s); -1 otherwise
++	int answering(int index)
++	{
++		if (g_port_dead[index])
++			return -1;
++		const int s = connect_to(helper_ports[index]);
++		if (s < 0)
++			return -1;
++		const int one = 1;
++		::setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
++		timeval tv{3, 0};
++		::setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
++		::setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
++		static constexpr char version[] = "\x04version";
++		const request q{magic, sizeof(version) - 1, 0, 0, 0};
++		s64 reply = 0;
++		if (!send_all(s, &q, sizeof(q)) || !send_all(s, version, sizeof(version) - 1) || !recv_all(s, &reply, sizeof(reply)))
++		{
++			sys_fs.error("PS5: write helper on :%u does not answer; not used again", helper_ports[index]);
++			g_port_dead[index] = true;
++			::close(s);
++			return -1;
++		}
++		// Answering (a first-version helper replies with an error): writes may take a while
++		timeval write_tv{10, 0};
++		::setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &write_tv, sizeof(write_tv));
++		::setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &write_tv, sizeof(write_tv));
++		g_port = index;
++		return s;
++	}
++
++	int any_answering()
++	{
++		for (int i = 0; i < 2; i++)
++			if (const int s = answering(i); s >= 0)
++				return s;
++		return -1;
++	}
++
+ 	// The helper connection, (re)connecting / starting the helper as needed; -1 when unavailable
+ 	int connection()
+ 	{
+@@ -874,7 +918,7 @@ namespace ps5_io
+ 		const u64 now = get_system_time();
+ 		if (now < g_retry_after)
+ 			return -1;
+-		int s = connect_to(helper_port);
++		int s = any_answering();
+ 		if (s < 0 && !g_launched)
+ 		{
+ 			g_launched = true;
+@@ -882,7 +926,7 @@ namespace ps5_io
+ 			for (int i = 0; i < 30 && s < 0; i++)
+ 			{
+ 				std::this_thread::sleep_for(std::chrono::milliseconds(100));
+-				s = connect_to(helper_port);
++				s = any_answering();
+ 			}
+ 		}
+ 		if (s < 0)
+@@ -891,12 +935,7 @@ namespace ps5_io
+ 			g_retry_after = now + 10'000'000;
+ 			return -1;
+ 		}
+-		const int one = 1;
+-		::setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+-		timeval tv{10, 0};
+-		::setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+-		::setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+-		sys_fs.notice("PS5: write helper connected");
++		sys_fs.notice("PS5: write helper connected on :%u", helper_ports[g_port]);
+ 		return g_sock = s;
+ 	}
+ 
+@@ -924,9 +963,10 @@ namespace ps5_io
+ 			s64 result = -1;
+ 			if (!send_all(s, &q, sizeof(q)) || !send_all(s, rel.data(), rel.size()) || !send_all(s, bounce.data(), block) || !recv_all(s, &result, sizeof(result)))
+ 			{
+-				sys_fs.error("PS5: write helper connection lost");
++				sys_fs.error("PS5: write helper connection lost; not used again on :%u", helper_ports[g_port]);
+ 				::close(s);
+ 				g_sock = -1;
++				g_port_dead[g_port] = true; // a helper that stopped answering stays stuck
+ 				break;
+ 			}
+ 			if (result <= 0)
+-- 
+2.43.0
+

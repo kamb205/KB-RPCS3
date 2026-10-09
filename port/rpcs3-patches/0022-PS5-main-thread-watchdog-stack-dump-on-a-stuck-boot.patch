@@ -1,0 +1,161 @@
+From e8479da213e27e2cb9abeac74cf7696eabea88b1 Mon Sep 17 00:00:00 2001
+From: KB <kb@kb-rpcs3.example>
+Date: Tue, 6 Oct 2026 10:48:53 +0100
+Subject: [PATCH 22/47] PS5: main-thread watchdog (stack dump on a stuck boot)
+
+---
+ rpcs3/ps5/ps5_frontend.cpp | 94 ++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 94 insertions(+)
+
+diff --git a/rpcs3/ps5/ps5_frontend.cpp b/rpcs3/ps5/ps5_frontend.cpp
+index 93f72bb97..7084675df 100644
+--- a/rpcs3/ps5/ps5_frontend.cpp
++++ b/rpcs3/ps5/ps5_frontend.cpp
+@@ -43,6 +43,10 @@
+ #include "util/sysinfo.hpp"
+ 
+ #include <cstdlib>
++#include <csignal>
++#include <signal.h>
++#include <pthread.h>
++#include <ucontext.h>
+ #include <deque>
+ #include <mutex>
+ #include <thread>
+@@ -243,6 +247,8 @@ void rpcs3ps5_read_host_pad(rpcs3ps5_pad* pad)
+ std::string g_input_config_override;
+ cfg_input_configurations g_cfg_input_configs;
+ 
++void rpcs3ps5_heartbeat(); // below: the main-thread watchdog
++
+ // Waits for wrapped_op, running what was posted to the main thread meanwhile
+ void qt_events_aware_op(int repeat_duration_ms, std::function<bool()> wrapped_op)
+ {
+@@ -250,7 +256,10 @@ void qt_events_aware_op(int repeat_duration_ms, std::function<bool()> wrapped_op
+ 	while (!wrapped_op())
+ 	{
+ 		if (thread_ctrl::is_main())
++		{
+ 			pump_main_thread();
++			rpcs3ps5_heartbeat();
++		}
+ 		std::this_thread::sleep_for(std::chrono::milliseconds(std::max(repeat_duration_ms, 1)));
+ 	}
+ }
+@@ -379,21 +388,105 @@ extern "C" int rpcs3ps5_install_package(const char* /*pkg_path*/)
+ 	return fail("package install is not ported yet");
+ }
+ 
++// ---- main-thread watchdog ----
++// A boot that stops making progress with the main thread blocked (console run 14: stuck right after
++// LIMBO's exports with the Vulkan renderer) is shown by its stack: the watchdog thread sends the main
++// thread SIGUSR2, whose handler scans its own stack for return addresses into the title image
++// (symbolise as addr-0x400000) and writes them to ps5-boot.log with write() (signal-safe enough here).
++extern "C" void rpcs3ps5_boot_log(const char* format, ...);
++namespace
++{
++pthread_t g_main_pthread;
++std::atomic<u64> g_main_heartbeat{0};
++std::atomic<bool> g_watchdog_run{false};
++std::thread g_watchdog;
++
++u64 now_ms()
++{
++	return get_system_time() / 1000;
++}
++
++void main_stack_dump(int, siginfo_t*, void* uct)
++{
++	auto* context = static_cast<ucontext_t*>(uct);
++	const u64 rsp = context->uc_mcontext.mc_rsp;
++	const u64 rip = context->uc_mcontext.mc_rip;
++	char line[1024];
++	int n = std::snprintf(line, sizeof(line), "watchdog: main thread rip=%#llx stack:", static_cast<unsigned long long>(rip));
++	for (u64 offset = 0; offset < 8192 && n < static_cast<int>(sizeof(line)) - 24; offset += 8)
++	{
++		const u64 value = *reinterpret_cast<const u64*>(rsp + offset);
++		if ((value >= 0x400000 && value < 0x5000000) || (value >= 0x800000000ull && value < 0x802000000ull))
++			n += std::snprintf(line + n, sizeof(line) - n, " %#llx", static_cast<unsigned long long>(value));
++	}
++	rpcs3ps5_boot_log("%s", line);
++}
++
++void start_watchdog()
++{
++	g_main_pthread = pthread_self();
++	struct sigaction action{};
++	action.sa_sigaction = main_stack_dump;
++	action.sa_flags = SA_SIGINFO | SA_RESTART;
++	sigaction(SIGUSR2, &action, nullptr);
++	g_main_heartbeat = now_ms();
++	g_watchdog_run = true;
++	g_watchdog = std::thread([]
++	{
++		u64 last_dump = 0;
++		while (g_watchdog_run)
++		{
++			std::this_thread::sleep_for(std::chrono::seconds(2));
++			const u64 now = now_ms();
++			if (now - g_main_heartbeat > 20000 && now - last_dump > 30000)
++			{
++				last_dump = now;
++				rpcs3ps5_boot_log("watchdog: main thread silent for %llu ms", static_cast<unsigned long long>(now - g_main_heartbeat));
++				pthread_kill(g_main_pthread, SIGUSR2);
++			}
++		}
++	});
++}
++
++} // namespace
++
++void rpcs3ps5_heartbeat()
++{
++	g_main_heartbeat = now_ms();
++}
++
++namespace
++{
++void stop_watchdog()
++{
++	g_watchdog_run = false;
++	if (g_watchdog.joinable())
++		g_watchdog.join();
++}
++} // namespace
++
+ extern "C" int rpcs3ps5_run(const char* path)
+ {
+ 	g_error.clear();
+ 	host_progress(fmt::format("Booting %s", path));
+ 	sys_log.always()("PS5: booting %s", path);
+ 
++	start_watchdog();
+ 	const game_boot_result result = Emu.BootGame(path, "", false, cfg_mode::custom);
++	g_main_heartbeat = now_ms();
++	rpcs3ps5_boot_log("run: BootGame returned %d", static_cast<int>(result));
+ 	if (result != game_boot_result::no_errors)
++	{
++		stop_watchdog();
+ 		return fail(fmt::format("boot failed: %s", result));
++	}
+ 
+ 	// Stand in for Qt's event loop until the game ends
+ 	u64 touch_held_ms = 0;
+ 	while (!Emu.IsStopped(true))
+ 	{
+ 		pump_main_thread();
++		g_main_heartbeat = now_ms();
+ 
+ 		rpcs3ps5_pad pad{};
+ 		if (g_host.read_pad)
+@@ -409,6 +502,7 @@ extern "C" int rpcs3ps5_run(const char* path)
+ 		std::this_thread::sleep_for(std::chrono::milliseconds(5));
+ 	}
+ 	pump_main_thread();
++	stop_watchdog();
+ 	host_progress("");
+ 	return 0;
+ }
+-- 
+2.43.0
+

@@ -1,0 +1,174 @@
+From ff79b92d70b8f86e73cc3f9bc196a141e726def8 Mon Sep 17 00:00:00 2001
+From: KB <kb@kb-rpcs3.example>
+Date: Thu, 8 Oct 2026 11:22:00 +0100
+Subject: [PATCH 39/47] PS5: every setting for the home screen
+ (rpcs3ps5_cfg_describe/set/apply_yaml/has_custom)
+
+---
+ rpcs3/ps5/ps5_frontend.cpp | 125 +++++++++++++++++++++++++++++++++++++
+ rpcs3/ps5/ps5_frontend.h   |  13 ++++
+ 2 files changed, 138 insertions(+)
+
+diff --git a/rpcs3/ps5/ps5_frontend.cpp b/rpcs3/ps5/ps5_frontend.cpp
+index 38b81fd17..850c98f83 100644
+--- a/rpcs3/ps5/ps5_frontend.cpp
++++ b/rpcs3/ps5/ps5_frontend.cpp
+@@ -458,6 +458,131 @@ extern "C" int rpcs3ps5_settings_clear(const char* title_id)
+ 	return 0;
+ }
+ 
++// ---- every setting, for the home screen's settings pages ----
++namespace
++{
++std::string g_describe;
++
++// Fixed on the console: apply_defaults_values() sets them again in every config
++bool locked_setting(const std::string& path)
++{
++	return path == "Video|Renderer" || path == "Video|Shader Mode" || path == "Audio|Renderer" ||
++		path == "Audio|Audio Format" || path == "Audio|Convert to 16 bit" || path == "Core|Max LLVM Compile Threads" ||
++		path == "Audio|Music Handler";
++}
++
++// What the settings pages leave out: file locations, logging, and the lists/maps no page can edit
++bool hidden_setting(const std::string& path, cfg::type type)
++{
++	return path.starts_with("VFS") || path.starts_with("Log") || type == cfg::type::map || type == cfg::type::node_map ||
++		type == cfg::type::log || type == cfg::type::device || type == cfg::type::uint128;
++}
++
++void describe_node(const cfg::node& node, const std::string& prefix, std::string& out)
++{
++	for (const cfg::_base* entry : node.get_nodes())
++	{
++		const std::string path = prefix.empty() ? entry->get_name() : prefix + "|" + entry->get_name();
++		const cfg::type type = entry->get_type();
++		if (type == cfg::type::node)
++		{
++			describe_node(*static_cast<const cfg::node*>(entry), path, out);
++			continue;
++		}
++		if (hidden_setting(path, type))
++			continue;
++		char kind = 's';
++		std::string choices;
++		const std::vector<std::string> list = entry->to_list();
++		switch (type)
++		{
++		case cfg::type::_bool: kind = 'b'; break;
++		case cfg::type::_enum: kind = 'e'; break;
++		case cfg::type::_int: kind = list.size() == 2 && list[0].find('.') != umax ? 'f' : 'i'; break;
++		case cfg::type::uint: kind = 'i'; break;
++		case cfg::type::set: kind = 'l'; break;
++		default: kind = 's'; break;
++		}
++		if (kind == 'l')
++			continue; // lists (e.g. libraries to load) come from recommended settings only
++		if (kind == 'e' || kind == 'i' || kind == 'f')
++		{
++			for (usz i = 0; i < list.size(); i++)
++			{
++				if (i)
++					choices += '\x1f';
++				choices += list[i];
++			}
++		}
++		std::string value = entry->to_string(), def = entry->def_to_string();
++		for (std::string* text : {&value, &def})
++			for (char& c : *text)
++				if (c == '\t' || c == '\n')
++					c = ' ';
++		fmt::append(out, "%s\t%c\t%s\t%s\t%s\t%s\n", path, kind, value, def, choices, locked_setting(path) ? "L" : "");
++	}
++}
++
++cfg::_base* find_setting(cfg::node& node, std::string_view path)
++{
++	const usz bar = path.find('|');
++	const std::string_view head = path.substr(0, bar);
++	for (cfg::_base* entry : node.get_nodes())
++	{
++		if (entry->get_name() != head)
++			continue;
++		if (bar == umax)
++			return entry;
++		return entry->get_type() == cfg::type::node ? find_setting(*static_cast<cfg::node*>(entry), path.substr(bar + 1)) : nullptr;
++	}
++	return nullptr;
++}
++} // namespace
++
++extern "C" const char* rpcs3ps5_cfg_describe(const char* title_id)
++{
++	load_settings(title_id);
++	g_describe.clear();
++	describe_node(g_cfg, "", g_describe);
++	load_settings(nullptr);
++	return g_describe.c_str();
++}
++
++extern "C" int rpcs3ps5_cfg_set(const char* title_id, const char* path, const char* value)
++{
++	if (!path || !value || locked_setting(path))
++		return -1;
++	load_settings(title_id);
++	cfg::_base* entry = find_setting(g_cfg, path);
++	const bool ok = entry && entry->get_type() != cfg::type::node && entry->from_string(value);
++	if (ok)
++	{
++		apply_defaults_values();
++		Emulator::SaveSettings(g_cfg.to_string(), title_id ? title_id : "");
++		sys_log.notice("PS5: setting %s = %s (%s)", path, value, title_id && *title_id ? title_id : "global");
++	}
++	load_settings(nullptr);
++	return ok ? 0 : -1;
++}
++
++extern "C" int rpcs3ps5_cfg_apply_yaml(const char* title_id, const char* yaml)
++{
++	if (!title_id || !*title_id || !yaml)
++		return -1;
++	load_settings(title_id);
++	const bool ok = g_cfg.from_string(yaml);
++	apply_defaults_values();
++	Emulator::SaveSettings(g_cfg.to_string(), title_id);
++	sys_log.notice("PS5: recommended settings applied to %s (%s)", title_id, ok ? "all taken" : "some refused");
++	load_settings(nullptr);
++	return ok ? 0 : 1;
++}
++
++extern "C" int rpcs3ps5_cfg_has_custom(const char* title_id)
++{
++	return title_id && *title_id && fs::is_file(settings_path(title_id)) ? 1 : 0;
++}
++
+ extern "C" int rpcs3ps5_iso_read(const char* iso, const char* inner, void* buffer, size_t capacity, size_t* size)
+ {
+ 	if (!iso || !inner || !buffer)
+diff --git a/rpcs3/ps5/ps5_frontend.h b/rpcs3/ps5/ps5_frontend.h
+index e24fbc5f5..72d9d931e 100644
+--- a/rpcs3/ps5/ps5_frontend.h
++++ b/rpcs3/ps5/ps5_frontend.h
+@@ -95,6 +95,19 @@ int rpcs3ps5_settings_clear(const char *title_id);
+ // .dkey beside it), e.g. inner = "PS3_GAME/PARAM.SFO". 0 when the whole file fit in buffer.
+ int rpcs3ps5_iso_read(const char *iso, const char *inner, void *buffer, size_t capacity, size_t *size);
+ 
++// Every setting of RPCS3's config (as the PC version's settings dialog has them), global for an empty or
++// null title ID, else the game's own (its custom config over the global one). One line per setting:
++//   section|...|name \t kind \t value \t default \t choices \t flags
++// kind: b (on/off), e (choice), i (whole number), f (decimal), s (text); choices: \x1f-separated (a choice),
++// or "min\x1fmax" (a number); flags: L = fixed on the console (shown, not changeable). Valid until the next call.
++const char *rpcs3ps5_cfg_describe(const char *title_id);
++// Sets one setting (path as described) for the title (or globally) and saves. 0 when it took.
++int rpcs3ps5_cfg_set(const char *title_id, const char *path, const char *value);
++// Applies config YAML (a recommended settings entry) on top of the title's settings and saves them as its own
++int rpcs3ps5_cfg_apply_yaml(const char *title_id, const char *yaml);
++// Whether the title has settings of its own
++int rpcs3ps5_cfg_has_custom(const char *title_id);
++
+ #ifdef __cplusplus
+ }
+ #endif
+-- 
+2.43.0
+

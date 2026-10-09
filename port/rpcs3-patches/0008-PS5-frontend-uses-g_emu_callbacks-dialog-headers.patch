@@ -1,0 +1,54 @@
+From d31f2f3a4823443971ea1a77edfd7672ca9f8956 Mon Sep 17 00:00:00 2001
+From: KB <kb@kb-rpcs3.example>
+Date: Sun, 4 Oct 2026 16:06:55 +0100
+Subject: [PATCH 08/47] PS5: frontend uses g_emu_callbacks; dialog headers
+
+---
+ rpcs3/ps5/ps5_frontend.cpp | 10 ++++++----
+ 1 file changed, 6 insertions(+), 4 deletions(-)
+
+diff --git a/rpcs3/ps5/ps5_frontend.cpp b/rpcs3/ps5/ps5_frontend.cpp
+index df9038c08..01d6169cd 100644
+--- a/rpcs3/ps5/ps5_frontend.cpp
++++ b/rpcs3/ps5/ps5_frontend.cpp
+@@ -27,6 +27,11 @@
+ #include "Emu/Io/Null/null_music_handler.h"
+ #include "Emu/Io/KeyboardHandler.h"
+ #include "Emu/Io/MouseHandler.h"
++#include "Emu/Cell/Modules/cellMsgDialog.h"
++#include "Emu/Cell/Modules/cellOskDialog.h"
++#include "Emu/Cell/Modules/cellSaveData.h"
++#include "Emu/Cell/Modules/sceNpTrophy.h"
++#include "util/video_source.h"
+ #include "Input/pad_thread.h"
+ #include "Loader/PUP.h"
+ #include "Loader/TAR.h"
+@@ -112,7 +117,7 @@ struct host_listener final : logs::listener
+ 
+ void create_callbacks()
+ {
+-	EmuCallbacks callbacks{};
++	emu_callbacks& callbacks = g_emu_callbacks;
+ 
+ 	callbacks.call_from_main_thread = [](std::function<void()> func, atomic_t<u32>* wake_up)
+ 	{
+@@ -162,8 +167,6 @@ void create_callbacks()
+ 	callbacks.get_msg_dialog = []() -> std::shared_ptr<MsgDialogBase> { return {}; };
+ 	callbacks.get_osk_dialog = []() -> std::shared_ptr<OskDialogBase> { return {}; };
+ 	callbacks.get_save_dialog = []() -> std::unique_ptr<SaveDialogBase> { return {}; };
+-	callbacks.get_sendmessage_dialog = []() -> std::shared_ptr<SendMessageDialogBase> { return {}; };
+-	callbacks.get_recvmessage_dialog = []() -> std::shared_ptr<RecvMessageDialogBase> { return {}; };
+ 	callbacks.get_trophy_notification_dialog = []() -> std::unique_ptr<TrophyNotificationBase> { return {}; };
+ 
+ 	callbacks.on_run = [](bool) {};
+@@ -194,7 +197,6 @@ void create_callbacks()
+ 	callbacks.get_photo_path = [](std::string_view) { return std::string{}; };
+ 	callbacks.get_database_config = [](const std::string&) { return std::string{}; };
+ 
+-	Emu.SetCallbacks(std::move(callbacks));
+ }
+ 
+ // The defaults a console without a settings screen needs
+-- 
+2.43.0
+

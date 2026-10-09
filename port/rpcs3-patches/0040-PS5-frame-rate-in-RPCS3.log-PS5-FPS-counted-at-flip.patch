@@ -1,0 +1,64 @@
+From 4b7c2defde8dd546c713a3eb3d0f7766aee9beee Mon Sep 17 00:00:00 2001
+From: KB <kb@kb-rpcs3.example>
+Date: Thu, 8 Oct 2026 11:31:19 +0100
+Subject: [PATCH 40/47] PS5: frame rate in RPCS3.log (PS5 FPS, counted at flip)
+
+---
+ rpcs3/ps5/ps5_frontend.cpp | 8 ++++++++
+ rpcs3/ps5/ps5_gs_frame.h   | 7 ++++++-
+ 2 files changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/rpcs3/ps5/ps5_frontend.cpp b/rpcs3/ps5/ps5_frontend.cpp
+index 850c98f83..d7340b75c 100644
+--- a/rpcs3/ps5/ps5_frontend.cpp
++++ b/rpcs3/ps5/ps5_frontend.cpp
+@@ -346,6 +346,8 @@ void rpcs3ps5_load_text_mirror(const char* path); // ps5_text_mirror.cpp
+ std::string g_input_config_override;
+ cfg_input_configurations g_cfg_input_configs;
+ 
++std::atomic<u64> g_ps5_flips{0};
++
+ void rpcs3ps5_heartbeat(); // below: the main-thread watchdog
+ std::string ps5_thread_cpu_report(u64 window_ns, usz top); // Utilities/Thread.cpp
+ std::string ps5_thread_profile(const std::string& name, usz count);
+@@ -776,6 +778,12 @@ void start_watchdog()
+ 			// CPU monitor: each RPCS3 thread's share of a core over the last ~4 s (100% = one core)
+ 			if (now - last_cpu >= 4000)
+ 			{
++				{
++					static u64 last_flips = 0;
++					const u64 flips = g_ps5_flips.load();
++					sys_log.notice("PS5 FPS: %.1f", (flips - last_flips) * 1000.0 / std::max<u64>(now - last_cpu, 1));
++					last_flips = flips;
++				}
+ 				sys_log.notice("PS5 CPU: %s", ps5_thread_cpu_report((now - last_cpu) * 1'000'000, 14));
+ 				{
+ 					const u64 calls = utils::g_ps5_mprotect_calls.exchange(0);
+diff --git a/rpcs3/ps5/ps5_gs_frame.h b/rpcs3/ps5/ps5_gs_frame.h
+index f483c314c..c882c0e18 100644
+--- a/rpcs3/ps5/ps5_gs_frame.h
++++ b/rpcs3/ps5/ps5_gs_frame.h
+@@ -4,6 +4,10 @@
+ 
+ #include "Emu/RSX/GSFrameBase.h"
+ 
++#include <atomic>
++
++extern std::atomic<u64> g_ps5_flips; // ps5_frontend.cpp
++
+ class ps5_gs_frame final : public GSFrameBase
+ {
+ public:
+@@ -17,7 +21,8 @@ public:
+ 	void delete_context(draw_context_t) override {}
+ 	draw_context_t make_context() override { return nullptr; }
+ 	void set_current(draw_context_t) override {}
+-	void flip(draw_context_t, bool) override {}
++	// Frames finished, for the frame rate in RPCS3.log ("PS5 FPS", ps5_frontend.cpp)
++	void flip(draw_context_t, bool) override { g_ps5_flips.fetch_add(1, std::memory_order_relaxed); }
+ 	// The console's one display mode
+ 	int client_width() override { return 3840; }
+ 	int client_height() override { return 2160; }
+-- 
+2.43.0
+

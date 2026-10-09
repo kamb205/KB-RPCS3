@@ -1,0 +1,181 @@
+From d3b3db001ec9ed1b365af5faea7d196ed0b94b5a Mon Sep 17 00:00:00 2001
+From: KB <kb@kb-rpcs3.example>
+Date: Tue, 6 Oct 2026 11:26:52 +0100
+Subject: [PATCH 28/47] PS5: read faulting instructions from a copy of the
+ execute-only title code
+
+---
+ Utilities/Thread.cpp          | 16 ++++++---
+ rpcs3/CMakeLists.txt          |  1 +
+ rpcs3/ps5/ps5_frontend.cpp    |  5 +++
+ rpcs3/ps5/ps5_text_mirror.cpp | 68 +++++++++++++++++++++++++++++++++++
+ 4 files changed, 86 insertions(+), 4 deletions(-)
+ create mode 100644 rpcs3/ps5/ps5_text_mirror.cpp
+
+diff --git a/Utilities/Thread.cpp b/Utilities/Thread.cpp
+index 69a1fa0d1..c82f47fa7 100644
+--- a/Utilities/Thread.cpp
++++ b/Utilities/Thread.cpp
+@@ -111,6 +111,14 @@ extern "C" [[noreturn]] void ps5_pthread_exit(void* value);
+ #define pthread_exit ps5_pthread_exit
+ #endif
+ 
++#ifdef __PROSPERO__
++// PS5: the title's code is execute-only; instruction bytes are read from a copy (rpcs3/ps5/ps5_text_mirror.cpp)
++extern "C" const u8* rpcs3ps5_readable_code(const u8* code);
++#define READABLE_CODE(p) rpcs3ps5_readable_code(reinterpret_cast<const u8*>(p))
++#else
++#define READABLE_CODE(p) reinterpret_cast<const u8*>(p)
++#endif
++
+ LOG_CHANNEL(sig_log, "SIG");
+ LOG_CHANNEL(sys_log, "SYS");
+ LOG_CHANNEL(vm_log, "VM");
+@@ -1078,7 +1086,7 @@ bool get_x64_reg_value(x64_context* context, x64_reg_t reg, usz d_size, usz i_si
+ 	else if (reg == X64_IMM8)
+ 	{
+ 		// load the immediate value (assuming it's at the end of the instruction)
+-		const s8 imm_value = *reinterpret_cast<s8*>(RIP(context) + i_size - 1);
++		const s8 imm_value = *reinterpret_cast<const s8*>(READABLE_CODE(RIP(context) + i_size - 1));
+ 
+ 		switch (d_size)
+ 		{
+@@ -1090,7 +1098,7 @@ bool get_x64_reg_value(x64_context* context, x64_reg_t reg, usz d_size, usz i_si
+ 	}
+ 	else if (reg == X64_IMM16)
+ 	{
+-		const s16 imm_value = *reinterpret_cast<s16*>(RIP(context) + i_size - 2);
++		const s16 imm_value = *reinterpret_cast<const s16*>(READABLE_CODE(RIP(context) + i_size - 2));
+ 
+ 		switch (d_size)
+ 		{
+@@ -1099,7 +1107,7 @@ bool get_x64_reg_value(x64_context* context, x64_reg_t reg, usz d_size, usz i_si
+ 	}
+ 	else if (reg == X64_IMM32)
+ 	{
+-		const s32 imm_value = *reinterpret_cast<s32*>(RIP(context) + i_size - 4);
++		const s32 imm_value = *reinterpret_cast<const s32*>(READABLE_CODE(RIP(context) + i_size - 4));
+ 
+ 		switch (d_size)
+ 		{
+@@ -1618,7 +1626,7 @@ bool handle_access_violation(u32 addr, bool is_writing, bool is_exec, ucontext_t
+ 	}
+ 
+ #if defined(ARCH_X64)
+-	const u8* const code = reinterpret_cast<u8*>(RIP(context));
++	const u8* const code = READABLE_CODE(RIP(context));
+ 
+ 	x64_op_t op;
+ 	x64_reg_t reg;
+diff --git a/rpcs3/CMakeLists.txt b/rpcs3/CMakeLists.txt
+index acccc537f..5324627c8 100644
+--- a/rpcs3/CMakeLists.txt
++++ b/rpcs3/CMakeLists.txt
+@@ -47,6 +47,7 @@ if (PS5)
+         ps5/ps5_pad_handler.cpp
+         ps5/ps5_audio_backend.cpp
+         ps5/ps5_stubs.cpp
++        ps5/ps5_text_mirror.cpp
+         Input/ps_move_tracker.cpp
+         Input/ps_move_config.cpp
+         Input/pad_thread.cpp
+diff --git a/rpcs3/ps5/ps5_frontend.cpp b/rpcs3/ps5/ps5_frontend.cpp
+index d3ff56545..3f83eb5e8 100644
+--- a/rpcs3/ps5/ps5_frontend.cpp
++++ b/rpcs3/ps5/ps5_frontend.cpp
+@@ -250,6 +250,8 @@ void rpcs3ps5_read_host_pad(rpcs3ps5_pad* pad)
+ 		*pad = {};
+ }
+ 
++void rpcs3ps5_load_text_mirror(const char* path); // ps5_text_mirror.cpp
++
+ // rpcs3.cpp's and rpcs3qt's, which the PS5 build does not have
+ std::string g_input_config_override;
+ cfg_input_configurations g_cfg_input_configs;
+@@ -398,6 +400,9 @@ extern "C" int rpcs3ps5_init(const char* root, const rpcs3ps5_host* host)
+ 	logs::listener::add(&listener);
+ 	sys_log.always()("RPCS3 PS5 frontend: config %s", fs::get_config_dir());
+ 
++	// The title's code is execute-only: RPCS3's fault handler reads instructions from a copy
++	rpcs3ps5_load_text_mirror("/app0/rpcs3ps5-text.bin");
++
+ 	create_callbacks();
+ 	// What main_application learns by probing (Qt's render_creator): on the console it is known.
+ 	// Without it RPCS3 resets the renderer to Null at every boot (fixup_settings), and the game
+diff --git a/rpcs3/ps5/ps5_text_mirror.cpp b/rpcs3/ps5/ps5_text_mirror.cpp
+new file mode 100644
+index 000000000..c4213bc4d
+--- /dev/null
++++ b/rpcs3/ps5/ps5_text_mirror.cpp
+@@ -0,0 +1,68 @@
++// RPCS3 PS5 - a readable copy of the title's own code.
++//
++// The console maps a title's code execute-only (SYSTEM_XO_VIOLATION on a read). RPCS3's access
++// violation handler reads the faulting x86 instruction to emulate it (Utilities/Thread.cpp:
++// decode_x64_reg_op and the immediates after it), and RPCS3 is linked into the title, so that read
++// faulted the moment an SPU transfer took the emulated path (WWE 12, console run 2). The build stages
++// the executable segment's bytes as /app0/rpcs3ps5-text.bin (tools/link-title.sh), loaded here once;
++// rpcs3ps5_readable_code() maps an address inside the code to the same byte in the copy.
++// SPDX-License-Identifier: GPL-2.0-only
++
++#include "stdafx.h"
++#include "util/types.hpp"
++
++#include <cstdio>
++#include <cstdlib>
++
++LOG_CHANNEL(sys_log, "SYS");
++
++extern "C" char __ehdr_start[] __attribute__((weak)); // the title's load address (lld)
++
++namespace
++{
++const u8* g_mirror = nullptr;
++uptr g_begin = 0;
++uptr g_end = 0;
++}
++
++extern "C" const u8* rpcs3ps5_readable_code(const u8* code)
++{
++	const uptr at = reinterpret_cast<uptr>(code);
++	if (g_mirror && at >= g_begin && at < g_end)
++		return g_mirror + (at - g_begin);
++	return code;
++}
++
++// "RPCS3PS5TEXT" header: the segment's link address and size, then its bytes
++void rpcs3ps5_load_text_mirror(const char* path)
++{
++	std::FILE* file = std::fopen(path, "rb");
++	if (!file)
++	{
++		sys_log.error("PS5: no readable code copy at %s: an emulated access in the title's code will fault", path);
++		return;
++	}
++	char magic[12]{};
++	u64 vaddr = 0, size = 0;
++	if (std::fread(magic, 1, 12, file) != 12 || std::memcmp(magic, "RPCS3PS5TEXT", 12) != 0 ||
++		std::fread(&vaddr, 8, 1, file) != 1 || std::fread(&size, 8, 1, file) != 1 || size == 0 || size > (1ull << 30))
++	{
++		sys_log.error("PS5: %s is not a code copy", path);
++		std::fclose(file);
++		return;
++	}
++	u8* copy = static_cast<u8*>(std::malloc(size));
++	if (!copy || std::fread(copy, 1, size, file) != size)
++	{
++		sys_log.error("PS5: could not read the code copy (%llu bytes)", size);
++		std::free(copy);
++		std::fclose(file);
++		return;
++	}
++	std::fclose(file);
++	const uptr base = __ehdr_start ? reinterpret_cast<uptr>(__ehdr_start) : 0x400000;
++	g_begin = base + vaddr;
++	g_end = g_begin + size;
++	g_mirror = copy;
++	sys_log.notice("PS5: readable code copy loaded: %p..%p (%llu MiB)", reinterpret_cast<void*>(g_begin), reinterpret_cast<void*>(g_end), size >> 20);
++}
+-- 
+2.43.0
+

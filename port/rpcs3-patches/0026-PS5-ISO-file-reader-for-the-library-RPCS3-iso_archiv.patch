@@ -1,0 +1,105 @@
+From 641d6782ecc35de474eb1709bb03551dd511371f Mon Sep 17 00:00:00 2001
+From: KB <kb@kb-rpcs3.example>
+Date: Tue, 6 Oct 2026 11:07:38 +0100
+Subject: [PATCH 26/47] PS5: ISO file reader for the library (RPCS3
+ iso_archive), quieter boot log
+
+---
+ rpcs3/ps5/ps5_frontend.cpp   | 19 +++++++++++++++++++
+ rpcs3/ps5/ps5_frontend.h     |  5 +++++
+ rpcs3/util/vm_native_ps5.cpp |  4 ----
+ 3 files changed, 24 insertions(+), 4 deletions(-)
+
+diff --git a/rpcs3/ps5/ps5_frontend.cpp b/rpcs3/ps5/ps5_frontend.cpp
+index 3adf4aa69..d3ff56545 100644
+--- a/rpcs3/ps5/ps5_frontend.cpp
++++ b/rpcs3/ps5/ps5_frontend.cpp
+@@ -36,6 +36,7 @@
+ #include "Emu/Io/pad_config.h"
+ #include "Loader/PUP.h"
+ #include "Loader/TAR.h"
++#include "Loader/ISO.h"
+ #include "Crypto/unself.h"
+ #include "Utilities/Thread.h"
+ #include "Utilities/File.h"
+@@ -361,6 +362,24 @@ extern "C" int rpcs3ps5_settings_clear(const char* title_id)
+ 	return 0;
+ }
+ 
++extern "C" int rpcs3ps5_iso_read(const char* iso, const char* inner, void* buffer, size_t capacity, size_t* size)
++{
++	if (!iso || !inner || !buffer)
++		return -1;
++	iso_archive archive(iso);
++	if (!archive.is_valid() || !archive.is_file(inner))
++		return -1;
++	std::unique_ptr<fs::file_base> file = archive.open(inner);
++	if (!file)
++		return -1;
++	const u64 bytes = file->size();
++	if (size)
++		*size = static_cast<size_t>(bytes);
++	if (bytes > capacity)
++		return -1;
++	return file->read(buffer, bytes) == bytes ? 0 : -1;
++}
++
+ extern "C" int rpcs3ps5_init(const char* root, const rpcs3ps5_host* host)
+ {
+ 	if (host)
+diff --git a/rpcs3/ps5/ps5_frontend.h b/rpcs3/ps5/ps5_frontend.h
+index d1a61a2e0..9bab8beab 100644
+--- a/rpcs3/ps5/ps5_frontend.h
++++ b/rpcs3/ps5/ps5_frontend.h
+@@ -5,6 +5,7 @@
+ #pragma once
+ 
+ #include <stdbool.h>
++#include <stddef.h>
+ #include <stdint.h>
+ 
+ #ifdef __cplusplus
+@@ -88,6 +89,10 @@ int rpcs3ps5_settings_set(const char *title_id, const struct rpcs3ps5_settings *
+ // Removes a game's own settings
+ int rpcs3ps5_settings_clear(const char *title_id);
+ 
++// Reads one file out of a PS3 disc image with RPCS3's own reader (decrypted, 3k3y, or Redump with a
++// .dkey beside it), e.g. inner = "PS3_GAME/PARAM.SFO". 0 when the whole file fit in buffer.
++int rpcs3ps5_iso_read(const char *iso, const char *inner, void *buffer, size_t capacity, size_t *size);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/rpcs3/util/vm_native_ps5.cpp b/rpcs3/util/vm_native_ps5.cpp
+index 7475f6948..1142540c2 100644
+--- a/rpcs3/util/vm_native_ps5.cpp
++++ b/rpcs3/util/vm_native_ps5.cpp
+@@ -121,9 +121,7 @@ namespace utils
+ 				return nullptr;
+ 			}
+ 
+-			rpcs3ps5_boot_log("vm: reserve 0x%llx bytes at %p", static_cast<unsigned long long>(size), use_addr);
+ 			const int error = ps5_vrange_reserve_at(use_addr, size);
+-			rpcs3ps5_boot_log("vm:   -> %s (0x%x)", error ? "refused" : "ok", error);
+ 			return error == 0 ? use_addr : nullptr;
+ 		}
+ 
+@@ -135,7 +133,6 @@ namespace utils
+ 		// The platform falls back to its own search from 0x4_0000_0000 when the hint is refused, so the
+ 		// result is checked here, and a running hint walks up 0x20..0x100_0000_0000 (1 TiB is the end).
+ 		static atomic_t<u64> s_next = 0x20'0000'0000ull;
+-		rpcs3ps5_boot_log("vm: reserve 0x%llx bytes anywhere", static_cast<unsigned long long>(size));
+ 		for (u64 hint = s_next; hint + size <= 0x100'0000'0000ull;)
+ 		{
+ 			void* base = nullptr;
+@@ -158,7 +155,6 @@ namespace utils
+ 			while (next < got + size && !s_next.compare_exchange(next, got + size))
+ 			{
+ 			}
+-			rpcs3ps5_boot_log("vm:   -> %p", base);
+ 			return base;
+ 		}
+ 		rpcs3ps5_boot_log("vm:   -> REFUSED (no room below 1 TiB)");
+-- 
+2.43.0
+

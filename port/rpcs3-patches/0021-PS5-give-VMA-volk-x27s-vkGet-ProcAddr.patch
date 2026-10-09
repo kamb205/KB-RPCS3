@@ -1,0 +1,31 @@
+From 9f1d18f6d91fc7ded640ceca9b53514518a699a3 Mon Sep 17 00:00:00 2001
+From: KB <kb@kb-rpcs3.example>
+Date: Tue, 6 Oct 2026 10:40:21 +0100
+Subject: [PATCH 21/47] PS5: give VMA volk\x27s vkGet*ProcAddr
+
+---
+ rpcs3/Emu/RSX/VK/vkutils/memory.cpp | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/rpcs3/Emu/RSX/VK/vkutils/memory.cpp b/rpcs3/Emu/RSX/VK/vkutils/memory.cpp
+index 7e1a2a00a..2ea3c7130 100644
+--- a/rpcs3/Emu/RSX/VK/vkutils/memory.cpp
++++ b/rpcs3/Emu/RSX/VK/vkutils/memory.cpp
+@@ -171,6 +171,14 @@ namespace vk
+ 		allocatorInfo.device = dev;
+ 		allocatorInfo.instance = inst;
+ 		allocatorInfo.vulkanApiVersion = VK_API_VERSION_1_2;
++#ifdef __PROSPERO__
++		// PS5: no loader; the commands are volk's (RADV linked into the title). VMA finds the rest
++		// from these two, which it otherwise took from a loader and called through NULL (run 13).
++		VmaVulkanFunctions vma_functions = {};
++		vma_functions.vkGetInstanceProcAddr = vkGetInstanceProcAddr;
++		vma_functions.vkGetDeviceProcAddr = vkGetDeviceProcAddr;
++		allocatorInfo.pVulkanFunctions = &vma_functions;
++#endif
+ 
+ 		std::vector<VkDeviceSize> heap_limits;
+ 		const auto vram_allocation_limit = g_cfg.video.vk.vram_allocation_limit * 0x100000ull;
+-- 
+2.43.0
+

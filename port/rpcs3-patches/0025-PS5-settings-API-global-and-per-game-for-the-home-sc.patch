@@ -1,0 +1,164 @@
+From 505bf679d0c00e21f669cdd11c60459053ce4f2e Mon Sep 17 00:00:00 2001
+From: KB <kb@kb-rpcs3.example>
+Date: Tue, 6 Oct 2026 11:04:22 +0100
+Subject: [PATCH 25/47] PS5: settings API (global and per game) for the home
+ screen
+
+---
+ rpcs3/ps5/ps5_frontend.cpp | 93 ++++++++++++++++++++++++++++++++++++--
+ rpcs3/ps5/ps5_frontend.h   | 18 ++++++++
+ 2 files changed, 107 insertions(+), 4 deletions(-)
+
+diff --git a/rpcs3/ps5/ps5_frontend.cpp b/rpcs3/ps5/ps5_frontend.cpp
+index 39cefea52..3adf4aa69 100644
+--- a/rpcs3/ps5/ps5_frontend.cpp
++++ b/rpcs3/ps5/ps5_frontend.cpp
+@@ -204,8 +204,8 @@ void create_callbacks()
+ 
+ }
+ 
+-// The defaults a console without a settings screen needs
+-void apply_defaults()
++// What the console needs, in every config (global and per game)
++void apply_defaults_values()
+ {
+ 	g_cfg.video.renderer.set(video_renderer::vulkan);
+ 	// No shader interpreter: its ubershader took minutes to build on the console with the boot waiting on it
+@@ -216,11 +216,14 @@ void apply_defaults()
+ 	g_cfg.audio.format.set(audio_format::stereo);
+ 	g_cfg.audio.convert_to_s16.set(true);
+ 	g_cfg.audio.music.set(music_handler::null);
+-	g_cfg.core.ppu_decoder.set(ppu_decoder_type::llvm);
+-	g_cfg.core.spu_decoder.set(spu_decoder_type::llvm);
+ 	// A title gets 13 CPUs; each LLVM compile thread holds hundreds of MiB of the direct-memory heap
+ 	g_cfg.core.llvm_threads.set(10);
+ 
++}
++
++void apply_defaults()
++{
++	apply_defaults_values();
+ 	// A game boot reloads config.yml, which held RPCS3's compiled-in defaults (renderer "Null" on
+ 	// this build: the game ran with no picture, console run 11): the defaults above go into it
+ 	Emulator::SaveSettings(g_cfg.to_string(), {});
+@@ -276,6 +279,88 @@ void qt_events_aware_op(int repeat_duration_ms, std::function<bool()> wrapped_op
+ 	std::abort();
+ }
+ 
++// ---- settings for the home screen ----
++namespace
++{
++std::string settings_path(const char* title_id)
++{
++	return title_id && *title_id ? rpcs3::utils::get_custom_config_path(title_id) : fs::get_config_dir(true) + "config.yml";
++}
++
++// g_cfg as the global config, then the game's own on top when it has one
++bool load_settings(const char* title_id)
++{
++	g_cfg.from_default();
++	if (fs::file global{settings_path(nullptr)})
++		g_cfg.from_string(global.to_string());
++	bool custom = false;
++	if (title_id && *title_id)
++	{
++		if (fs::file own{settings_path(title_id)})
++		{
++			g_cfg.from_string(own.to_string());
++			custom = true;
++		}
++	}
++	return custom;
++}
++} // namespace
++
++extern "C" int rpcs3ps5_settings_get(const char* title_id, rpcs3ps5_settings* out, bool* custom)
++{
++	if (!out)
++		return -1;
++	const bool own = load_settings(title_id);
++	if (custom)
++		*custom = own;
++	out->resolution_scale = static_cast<int>(g_cfg.video.resolution_scale_percent.get());
++	switch (g_cfg.video.frame_limit.get())
++	{
++	case frame_limit_type::none: out->frame_limit = 1; break;
++	case frame_limit_type::_30: out->frame_limit = 2; break;
++	case frame_limit_type::_60: out->frame_limit = 3; break;
++	default: out->frame_limit = 0; break;
++	}
++	out->perf_overlay = g_cfg.video.perf_overlay.enabled ? 1 : 0;
++	out->ppu_decoder = g_cfg.core.ppu_decoder == ppu_decoder_type::llvm ? 0 : 1;
++	switch (g_cfg.core.spu_decoder.get())
++	{
++	case spu_decoder_type::llvm: out->spu_decoder = 0; break;
++	case spu_decoder_type::asmjit: out->spu_decoder = 1; break;
++	default: out->spu_decoder = 2; break;
++	}
++	load_settings(nullptr); // leave g_cfg global
++	return 0;
++}
++
++extern "C" int rpcs3ps5_settings_set(const char* title_id, const rpcs3ps5_settings* in)
++{
++	if (!in)
++		return -1;
++	load_settings(title_id);
++	g_cfg.video.resolution_scale_percent.set(static_cast<u32>(std::clamp(in->resolution_scale, 25, 800)));
++	static constexpr frame_limit_type limits[] = {frame_limit_type::_auto, frame_limit_type::none, frame_limit_type::_30, frame_limit_type::_60};
++	g_cfg.video.frame_limit.set(limits[std::clamp(in->frame_limit, 0, 3)]);
++	g_cfg.video.perf_overlay.enabled.set(in->perf_overlay != 0);
++	g_cfg.core.ppu_decoder.set(in->ppu_decoder == 0 ? ppu_decoder_type::llvm : ppu_decoder_type::_static);
++	static constexpr spu_decoder_type spus[] = {spu_decoder_type::llvm, spu_decoder_type::asmjit, spu_decoder_type::_static};
++	g_cfg.core.spu_decoder.set(spus[std::clamp(in->spu_decoder, 0, 2)]);
++	// What the console needs stays as apply_defaults made it, in every config
++	apply_defaults_values();
++	Emulator::SaveSettings(g_cfg.to_string(), title_id ? title_id : "");
++	sys_log.notice("PS5: settings saved (%s)", title_id && *title_id ? title_id : "global");
++	load_settings(nullptr);
++	return 0;
++}
++
++extern "C" int rpcs3ps5_settings_clear(const char* title_id)
++{
++	if (!title_id || !*title_id)
++		return -1;
++	fs::remove_file(settings_path(title_id));
++	return 0;
++}
++
+ extern "C" int rpcs3ps5_init(const char* root, const rpcs3ps5_host* host)
+ {
+ 	if (host)
+diff --git a/rpcs3/ps5/ps5_frontend.h b/rpcs3/ps5/ps5_frontend.h
+index f05be41b1..d1a61a2e0 100644
+--- a/rpcs3/ps5/ps5_frontend.h
++++ b/rpcs3/ps5/ps5_frontend.h
+@@ -70,6 +70,24 @@ int rpcs3ps5_run(const char *path);
+ 
+ const char *rpcs3ps5_error(void);
+ 
++// The settings the home screen offers, global (title_id NULL or "") or for one game (its title ID).
++// A game's settings are a full config of its own (RPCS3's custom config), made from the global one
++// the first time it is changed; clearing it makes the game use the global settings again.
++struct rpcs3ps5_settings
++{
++	int resolution_scale; // percent: 100 (720p), 150, 200, 300 (4K)
++	int frame_limit;      // 0 auto, 1 off, 2 = 30, 3 = 60
++	int perf_overlay;     // 0 off, 1 on (frame rate and frame time on screen)
++	int ppu_decoder;      // 0 LLVM, 1 interpreter
++	int spu_decoder;      // 0 LLVM, 1 ASMJIT, 2 interpreter
++};
++// Reads; *custom (may be NULL) says whether the game has settings of its own
++int rpcs3ps5_settings_get(const char *title_id, struct rpcs3ps5_settings *out, bool *custom);
++// Writes and saves
++int rpcs3ps5_settings_set(const char *title_id, const struct rpcs3ps5_settings *in);
++// Removes a game's own settings
++int rpcs3ps5_settings_clear(const char *title_id);
++
+ #ifdef __cplusplus
+ }
+ #endif
+-- 
+2.43.0
+

@@ -1,0 +1,43 @@
+From 5ac279c37f06a0450c7e45a22ca1ce908addab7f Mon Sep 17 00:00:00 2001
+From: KB <kb@kb-rpcs3.example>
+Date: Sun, 4 Oct 2026 16:14:02 +0100
+Subject: [PATCH 10/47] PS5: thread_local init hooks and gcov stubs for the
+ title packer
+
+---
+ rpcs3/ps5/ps5_stubs.cpp | 22 ++++++++++++++++++++++
+ 1 file changed, 22 insertions(+)
+
+diff --git a/rpcs3/ps5/ps5_stubs.cpp b/rpcs3/ps5/ps5_stubs.cpp
+index 32aae5a93..4d6851126 100644
+--- a/rpcs3/ps5/ps5_stubs.cpp
++++ b/rpcs3/ps5/ps5_stubs.cpp
+@@ -158,3 +158,25 @@ int getpagesizes(size_t sizes[], int count)
+ 	return count >= 1 ? 1 : 0;
+ }
+ }
++
++// ---- thread_local init hooks ----
++// extern thread_local variables reach their initialisation through a weak _ZTH* hook,
++// left undefined when the variable needs none; the title packer refuses an undefined
++// import, so each is defined empty (their variables have constant initialisers).
++extern "C"
++{
++void _ZTH16g_tls_log_prefix() {}
++void _ZTH17g_tls_log_control() {}
++void _ZTH20g_tls_serialize_name() {}
++void _ZTHN10cpu_thread17g_tls_this_threadE() {}
++void _ZTHN10id_manager4g_idE() {}
++void _ZTHN11thread_ctrl17g_tls_this_threadE() {}
++void _ZTHN2fs11g_tls_errorE() {}
++void _ZTHN2vm12g_tls_lockedE() {}
++void _ZTHN7lv2_obj11g_to_notifyE() {}
++void _ZTHN7lv2_obj25g_postpone_notify_barrierE() {}
++}
++
++// ---- coverage hooks some library references weakly (never built with coverage) ----
++extern "C" void __gcov_dump() {}
++extern "C" void __gcov_flush() {}
+-- 
+2.43.0
+

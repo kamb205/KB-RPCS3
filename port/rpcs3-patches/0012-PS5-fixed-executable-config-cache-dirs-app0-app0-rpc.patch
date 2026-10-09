@@ -1,0 +1,70 @@
+From 475e139e96902f898946cb61e777ddb03fea4759 Mon Sep 17 00:00:00 2001
+From: KB <kb@kb-rpcs3.example>
+Date: Sun, 4 Oct 2026 16:58:08 +0100
+Subject: [PATCH 12/47] PS5: fixed executable/config/cache dirs (/app0,
+ /app0/rpcs3); avoid std::cout in static init
+
+---
+ Utilities/File.cpp | 25 +++++++++++++++++++++----
+ 1 file changed, 21 insertions(+), 4 deletions(-)
+
+diff --git a/Utilities/File.cpp b/Utilities/File.cpp
+index e8c7ab6e9..bf0e8b404 100644
+--- a/Utilities/File.cpp
++++ b/Utilities/File.cpp
+@@ -2443,7 +2443,11 @@ bool fs::file::strict_read_check(u64 offset, u64 _size, u64 type_size) const
+ 
+ std::string fs::get_executable_path()
+ {
+-#ifdef ANDROID
++#if defined(__PROSPERO__)
++	// PS5: the title image is mounted at /app0. (Static constructors call this before
++	// iostreams exist; the generic path below prints to std::cout and crashed there.)
++	return "/app0/eboot.bin";
++#elif defined(ANDROID)
+ 	return g_android_executable_dir + "/dummy-rpcs3.apk";
+ #else
+ 	// Use magic static
+@@ -2496,7 +2500,9 @@ std::string fs::get_executable_path()
+ 
+ std::string fs::get_executable_dir()
+ {
+-#ifdef ANDROID
++#if defined(__PROSPERO__)
++	return "/app0/";
++#elif defined(ANDROID)
+ 	return g_android_executable_dir;
+ #else
+ 	// Use magic static
+@@ -2517,7 +2523,16 @@ std::string fs::get_executable_dir()
+ 
+ const std::string& fs::get_config_dir([[maybe_unused]] bool get_config_subdirectory)
+ {
+-#ifdef ANDROID
++#if defined(__PROSPERO__)
++	// PS5: everything in the title folder, /app0/rpcs3/ (= /data/homebrew/<TITLEID>/rpcs3 over FTP)
++	static const std::string s_dir = []
++	{
++		const std::string dir = "/app0/rpcs3/";
++		create_path(dir);
++		return dir;
++	}();
++	return s_dir;
++#elif defined(ANDROID)
+ 	return g_android_config_dir;
+ #else
+ 	// Use magic static
+@@ -2615,7 +2630,9 @@ const std::string& fs::get_config_dir([[maybe_unused]] bool get_config_subdirect
+ 
+ const std::string& fs::get_cache_dir()
+ {
+-#ifdef ANDROID
++#if defined(__PROSPERO__)
++	return get_config_dir();
++#elif defined(ANDROID)
+ 	return g_android_cache_dir;
+ #else
+ 	static const std::string s_dir = []
+-- 
+2.43.0
+

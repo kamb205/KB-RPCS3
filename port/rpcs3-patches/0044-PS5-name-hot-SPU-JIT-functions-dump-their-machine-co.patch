@@ -1,0 +1,215 @@
+From be8e8941b52a5cd1d7567a369cb72208022ba1e9 Mon Sep 17 00:00:00 2001
+From: KB <kb@kb-rpcs3.example>
+Date: Thu, 8 Oct 2026 17:03:22 +0100
+Subject: [PATCH 44/47] PS5: name hot SPU JIT functions + dump their machine
+ code; log the core clock
+
+Profiler (Utilities/Thread.cpp): SPULLVMRecompiler.cpp registers each compiled SPU
+function as spu-<entry>-<hash>; profile samples in JIT memory are charged to the
+function starting below them and reported as "SPU code N of M samples: <func>:<hits>",
+with the hottest offsets of the top 3; their machine code is saved once to
+/app0/rpcs3/jit/<name>.bin (.addr alongside) for offline llvm-objdump.
+
+Core clock (rpcs3/ps5/ps5_frontend.cpp): a dependent-add chain timed with the TSC,
+logged next to PS5 CPU, to show whether the title gets the full CPU clock.
+---
+ Utilities/Thread.cpp                 | 91 ++++++++++++++++++++++++++++
+ rpcs3/Emu/Cell/SPULLVMRecompiler.cpp |  8 +++
+ rpcs3/ps5/ps5_frontend.cpp           | 25 ++++++++
+ 3 files changed, 124 insertions(+)
+
+diff --git a/Utilities/Thread.cpp b/Utilities/Thread.cpp
+index c8576cf90..21f72122a 100644
+--- a/Utilities/Thread.cpp
++++ b/Utilities/Thread.cpp
+@@ -48,6 +48,8 @@ DYNAMIC_IMPORT_RENAME("Kernel32.dll", SetThreadDescriptionImport, "SetThreadDesc
+ #include <errno.h>
+ #include <signal.h>
+ #include <unordered_map>
++#include <set>
++#include <map>
+ #ifndef __OpenBSD__
+ #include <ucontext.h>
+ #endif
+@@ -2959,6 +2961,49 @@ std::string ps5_thread_top_name(usz i)
+ 
+ // Samples where the thread named `name` executes, `count` times 5 ms apart; "addr:hits ..." (most hit first),
+ // addresses as in the title image (symbolise addr-0x400000 against llvm-pie.elf)
++// SPU JIT code by name (2026-10-08): SPULLVMRecompiler.cpp registers each compiled SPU function's start address
++// and name ("spu-<entry>-<hash>"); profile samples in JIT memory are charged to the function starting below them.
++// The machine code of the hottest functions is saved once to /app0/rpcs3/jit/<name>.bin for offline disassembly.
++namespace
++{
++	std::mutex g_ps5_jit_mutex;
++	std::map<u64, std::string> g_ps5_jit_names;
++}
++
++void ps5_jit_name(u64 addr, std::string name)
++{
++	std::lock_guard lock(g_ps5_jit_mutex);
++	g_ps5_jit_names[addr] = std::move(name);
++}
++
++// The function's name and the offset into it, or an empty name
++static std::pair<std::string, u64> ps5_jit_lookup(u64 addr)
++{
++	std::lock_guard lock(g_ps5_jit_mutex);
++	auto it = g_ps5_jit_names.upper_bound(addr);
++	if (it == g_ps5_jit_names.begin())
++		return {};
++	--it;
++	// No SPU function is anywhere near 256 KiB of machine code: further away is something else
++	if (addr - it->first >= 0x40000)
++		return {};
++	return {it->second, addr - it->first};
++}
++
++static void ps5_jit_save(const std::string& name, u64 start, u64 bytes)
++{
++	static std::set<std::string> saved;
++	static std::mutex saved_mutex;
++	{
++		std::lock_guard lock(saved_mutex);
++		if (!saved.insert(name).second)
++			return;
++	}
++	fs::create_path("/app0/rpcs3/jit");
++	fs::write_file("/app0/rpcs3/jit/" + name + ".bin", fs::rewrite, reinterpret_cast<const void*>(start), bytes);
++	fs::write_file("/app0/rpcs3/jit/" + name + ".addr", fs::rewrite, fmt::format("0x%x\n", start));
++}
++
+ std::string ps5_thread_profile(const std::string& name, usz count)
+ {
+ 	pthread_t thread{};
+@@ -3008,6 +3053,52 @@ std::string ps5_thread_profile(const std::string& name, usz count)
+ 	std::string out = "system code:";
+ 	for (usz i = 0; i < rips.size() && i < 8; i++)
+ 		fmt::append(out, " %x:%u", rips[i].second, rips[i].first);
++	{
++		// The same samples by SPU function (JIT code), with the hottest offsets of the top functions
++		std::map<std::string, u32> func_hits;
++		std::map<std::string, std::map<u64, u32>> func_offsets;
++		std::map<std::string, u64> func_start;
++		u32 jit_total = 0;
++		for (usz i = 0; i < n; i++)
++		{
++			if (!g_ps5_sample_rips[i])
++				continue;
++			const auto [fname, offset] = ps5_jit_lookup(g_ps5_sample_rips[i]);
++			if (fname.empty())
++				continue;
++			jit_total++;
++			func_hits[fname]++;
++			func_offsets[fname][offset]++;
++			func_start[fname] = g_ps5_sample_rips[i] - offset;
++		}
++		std::vector<std::pair<u32, std::string>> funcs;
++		for (const auto& [fname, h] : func_hits)
++			funcs.emplace_back(h, fname);
++		std::sort(funcs.begin(), funcs.end(), std::greater<>());
++		fmt::append(out, " | SPU code %u of %u samples:", jit_total, n);
++		for (usz i = 0; i < funcs.size() && i < 12; i++)
++		{
++			fmt::append(out, " %s:%u", funcs[i].second, funcs[i].first);
++			if (i < 3)
++			{
++				const auto& offs = func_offsets[funcs[i].second];
++				std::vector<std::pair<u32, u64>> top;
++				u64 furthest = 0;
++				for (const auto& [o, h] : offs)
++				{
++					top.emplace_back(h, o);
++					furthest = std::max(furthest, o);
++				}
++				std::sort(top.begin(), top.end(), std::greater<>());
++				out += "[";
++				for (usz k = 0; k < top.size() && k < 6; k++)
++					fmt::append(out, "%s+%x:%u", k ? " " : "", top[k].second, top[k].first);
++				out += "]";
++				// Enough code to cover every sampled offset, plus a margin
++				ps5_jit_save(funcs[i].second, func_start[funcs[i].second], std::min<u64>(furthest + 0x2000, 0x40000));
++			}
++		}
++	}
+ 	fmt::append(out, " | %u samples:", n);
+ 	for (usz i = 0; i < sorted.size() && i < 60; i++)
+ 		if (sorted[i].second >> 63)
+diff --git a/rpcs3/Emu/Cell/SPULLVMRecompiler.cpp b/rpcs3/Emu/Cell/SPULLVMRecompiler.cpp
+index c444e5e98..4d6173a32 100644
+--- a/rpcs3/Emu/Cell/SPULLVMRecompiler.cpp
++++ b/rpcs3/Emu/Cell/SPULLVMRecompiler.cpp
+@@ -29,6 +29,10 @@ const extern spu_decoder<spu_iflag> g_spu_iflag;
+ 
+ #include "Emu/CPU/CPUTranslator.h"
+ 
++#ifdef __PROSPERO__
++void ps5_jit_name(u64 addr, std::string name); // Utilities/Thread.cpp
++#endif
++
+ #ifdef _MSC_VER
+ #pragma warning(push, 0)
+ #else
+@@ -3999,6 +4003,10 @@ public:
+ 
+ 		// Register function pointer
+ 		const spu_function_t fn = reinterpret_cast<spu_function_t>(m_jit.get_engine().getPointerToFunction(main_func));
++#ifdef __PROSPERO__
++		// The profiler names samples in this code after the SPU function (Utilities/Thread.cpp)
++		ps5_jit_name(reinterpret_cast<u64>(fn), fmt::format("spu-%05x-%s", func.entry_point, m_hash));
++#endif
+ 
+ 		// Install unconditionally, possibly replacing existing one from spu_fast
+ 		add_loc->compiled = fn;
+diff --git a/rpcs3/ps5/ps5_frontend.cpp b/rpcs3/ps5/ps5_frontend.cpp
+index e3f2a5615..ceab67395 100644
+--- a/rpcs3/ps5/ps5_frontend.cpp
++++ b/rpcs3/ps5/ps5_frontend.cpp
+@@ -47,6 +47,7 @@
+ #include "Utilities/File.h"
+ #include "util/logs.hpp"
+ #include "util/sysinfo.hpp"
++#include "util/tsc.hpp"
+ 
+ #include <cstdlib>
+ #include <csignal>
+@@ -57,6 +58,29 @@
+ #include <mutex>
+ #include <thread>
+ 
++
++// The clock this thread's core runs at: a chain of dependent adds (one cycle each on Zen 2) timed with the TSC,
++// best of 3 runs of 1.6 M cycles (~0.5 ms each). Tells whether the console gives the title its full CPU clock.
++static u32 ps5_core_mhz()
++{
++	constexpr u64 rounds = 200'000; // 8 adds per round
++	u64 best = umax;
++	for (int run = 0; run < 3; run++)
++	{
++		u64 x = 0, i = rounds;
++		const u64 t0 = utils::get_tsc();
++		__asm__ volatile(
++			"1:\n\t"
++			"addq $1, %0\n\taddq $1, %0\n\taddq $1, %0\n\taddq $1, %0\n\t"
++			"addq $1, %0\n\taddq $1, %0\n\taddq $1, %0\n\taddq $1, %0\n\t"
++			"decq %1\n\t"
++			"jnz 1b"
++			: "+r"(x), "+r"(i));
++		best = std::min(best, utils::get_tsc() - t0);
++	}
++	return static_cast<u32>(rounds * 8 * (utils::get_tsc_freq() / 1000) / std::max<u64>(best, 1) / 1000);
++}
++
+ LOG_CHANNEL(sys_log, "SYS");
+ 
+ std::string ps5_localized_string(localized_string_id id, const char* args); // ps5_localized.cpp
+@@ -850,6 +874,7 @@ void start_watchdog()
+ 					last_flips = flips;
+ 				}
+ 				sys_log.notice("PS5 CPU: %s", ps5_thread_cpu_report(window_ms * 1'000'000, 14));
++				sys_log.notice("PS5 core clock: %u MHz", ps5_core_mhz());
+ 				{
+ 					const u64 calls = utils::g_ps5_mprotect_calls.exchange(0);
+ 					const u64 tsc = utils::g_ps5_mprotect_tsc.exchange(0);
+-- 
+2.43.0
+

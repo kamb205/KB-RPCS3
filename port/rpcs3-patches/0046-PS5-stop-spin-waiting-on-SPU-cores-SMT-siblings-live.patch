@@ -1,0 +1,308 @@
+From d74bf2e3371f0260858f3a3390cd52c1b2131e86 Mon Sep 17 00:00:00 2001
+From: KB <kb@kb-rpcs3.example>
+Date: Thu, 8 Oct 2026 19:31:50 +0100
+Subject: [PATCH 46/47] PS5: stop spin-waiting on SPU cores SMT siblings - live
+ spin/backoff tunables + counters
+
+Live tuning file /app0/rpcs3/ps5-tuning.txt (app/ps5/src/ps5_tuning.c) drives:
+- RADV radv_ps5_queue_wait_seq: spin/sleep times + wait counters
+- RPCS3 vk::wait_for_event: spin/sleep + counters
+- an optional RSX main-thread CPU pin (Thread.cpp ps5_rsx_main_affinity, RSXThread.cpp)
+Defaults equal the behaviour before the experiment (RADV 4ms spin/100us sleep, vk unbounded spin,
+no pin), so deleting the file restores it. Frontend logs PS5 TUNING (when it changes) and PS5 WAITS
+(per report), and profiles rsx::thread every 5th slot.
+---
+ Utilities/Thread.cpp              | 46 ++++++++++++++++++++++-
+ rpcs3/Emu/RSX/RSXThread.cpp       |  9 +++++
+ rpcs3/Emu/RSX/VK/vkutils/sync.cpp | 62 +++++++++++++++++++++++++++++++
+ rpcs3/ps5/ps5_frontend.cpp        | 52 +++++++++++++++++++++++++-
+ 4 files changed, 166 insertions(+), 3 deletions(-)
+
+diff --git a/Utilities/Thread.cpp b/Utilities/Thread.cpp
+index 21f72122a..2421672fd 100644
+--- a/Utilities/Thread.cpp
++++ b/Utilities/Thread.cpp
+@@ -3957,6 +3957,9 @@ void thread_ctrl::detect_cpu_layout()
+ // kPs5Sibling: the distance between a core's two CPUs (1: CPUs 0+1, 2+3, ...).
+ constexpr u32 kPs5Sibling = 1;
+ 
++extern "C" int64_t rpcs3ps5_tune(int key); // app/ps5/src/ps5_tuning.c
++enum { PS5_TUNE_RSX_CPU = 4 };
++
+ static u64 ps5_affinity_mask(thread_class group, u64 all)
+ {
+ 	u64 firsts = 0, seconds = 0;
+@@ -3977,14 +3980,53 @@ static u64 ps5_affinity_mask(thread_class group, u64 all)
+ 		return true;
+ 	}();
+ 	(void)logged;
++	const int64_t rsx_cpu = rpcs3ps5_tune(PS5_TUNE_RSX_CPU);
++
+ 	switch (group)
+ 	{
+-	case thread_class::spu: return firsts ? firsts : all;
++	case thread_class::spu:
++	{
++		u64 m = firsts ? firsts : all;
++		if (rsx_cpu >= 0 && (m & ~(1ull << rsx_cpu)))
++			m &= ~(1ull << rsx_cpu);
++		return m;
++	}
+ 	case thread_class::ppu:
+-	case thread_class::rsx: return seconds ? seconds : all;
++	{
++		u64 m = seconds ? seconds : all;
++		if (rsx_cpu >= 0 && (m & ~(1ull << rsx_cpu)))
++			m &= ~(1ull << rsx_cpu);
++		return m;
++	}
++	case thread_class::rsx:
++	{
++		u64 m = seconds ? seconds : all;
++		if (rsx_cpu >= 0 && (m & ~(1ull << rsx_cpu)))
++			m &= ~(1ull << rsx_cpu);
++		return m;
++	}
+ 	default: return all;
+ 	}
+ }
++
++// The RSX MAIN thread's mask: CPU <rsx_cpu> when the tuning file asks for it, else the normal mask. Only the
++// main RSX thread calls this (RSXOffload.cpp keeps get_affinity_mask), so the RSX Offloader never shares it.
++u64 ps5_rsx_main_affinity(u64 fallback)
++{
++	const int64_t rsx_cpu = rpcs3ps5_tune(PS5_TUNE_RSX_CPU);
++
++	if (rsx_cpu >= 0 && rsx_cpu < 64 && (thread_ctrl::get_process_affinity_mask() >> rsx_cpu & 1))
++	{
++		static const bool logged = [rsx_cpu] {
++			sig_log.notice("PS5: rsx::thread pinned to CPU %d", static_cast<int>(rsx_cpu));
++			return true;
++		}();
++		(void)logged;
++		return 1ull << rsx_cpu;
++	}
++
++	return fallback;
++}
+ #endif
+ 
+ u64 thread_ctrl::get_affinity_mask(thread_class group)
+diff --git a/rpcs3/Emu/RSX/RSXThread.cpp b/rpcs3/Emu/RSX/RSXThread.cpp
+index 24ed243e6..f61fc5533 100644
+--- a/rpcs3/Emu/RSX/RSXThread.cpp
++++ b/rpcs3/Emu/RSX/RSXThread.cpp
+@@ -12,6 +12,10 @@
+ #include "Program/GLSLCommon.h"
+ #include "rsx_methods.h"
+ 
++#ifdef __PROSPERO__
++u64 ps5_rsx_main_affinity(u64 fallback); // Utilities/Thread.cpp
++#endif
++
+ #include "gcm_printing.h"
+ #include "RSXDisAsm.h"
+ 
+@@ -1258,7 +1262,12 @@ namespace rsx
+ 
+ 		if (g_cfg.core.thread_scheduler != thread_scheduler_mode::os)
+ 		{
++#ifdef __PROSPERO__
++			// PS5: the main RSX thread may be pinned to one CPU (tuning file); the Offloader is not.
++			thread_ctrl::set_thread_affinity_mask(ps5_rsx_main_affinity(thread_ctrl::get_affinity_mask(thread_class::rsx)));
++#else
+ 			thread_ctrl::set_thread_affinity_mask(thread_ctrl::get_affinity_mask(thread_class::rsx));
++#endif
+ 		}
+ 
+ 		if (auto manager = g_fxo->try_get<rsx::overlays::display_manager>())
+diff --git a/rpcs3/Emu/RSX/VK/vkutils/sync.cpp b/rpcs3/Emu/RSX/VK/vkutils/sync.cpp
+index 4041f4fa0..55006e37d 100644
+--- a/rpcs3/Emu/RSX/VK/vkutils/sync.cpp
++++ b/rpcs3/Emu/RSX/VK/vkutils/sync.cpp
+@@ -12,6 +12,12 @@
+ #include "util/asm.hpp"
+ #include "util/logs.hpp"
+ 
++#ifdef __PROSPERO__
++#include <atomic>
++#include <chrono>
++#include <thread>
++#endif
++
+ namespace vk
+ {
+ 	namespace globals
+@@ -587,6 +593,22 @@ namespace vk
+ 		}
+ 	}
+ 
++#ifdef __PROSPERO__
++	// PS5: live spin/backoff tunables from the title (app/ps5/src/ps5_tuning.c) and counters for the frontend
++	// ("PS5 WAITS", ps5_frontend.cpp). spin_us < 0 = unbounded spin (today's behaviour); 0 = sleep at once.
++	extern "C" int64_t rpcs3ps5_tune(int key);
++	enum { PS5_TUNE_VK_EVENT_SPIN_US = 2, PS5_TUNE_VK_EVENT_SLEEP_US = 3 };
++	static std::atomic<u64> g_ps5_vk_event_waits{0};
++	static std::atomic<u64> g_ps5_vk_event_spin_tsc{0};
++	static std::atomic<u64> g_ps5_vk_event_sleeps{0};
++	extern "C" void ps5_vk_event_stats(uint64_t* waits, uint64_t* spin_tsc, uint64_t* sleeps)
++	{
++		*waits = g_ps5_vk_event_waits.load(std::memory_order_relaxed);
++		*spin_tsc = g_ps5_vk_event_spin_tsc.load(std::memory_order_relaxed);
++		*sleeps = g_ps5_vk_event_sleeps.load(std::memory_order_relaxed);
++	}
++#endif
++
+ 	VkResult wait_for_event(event* pEvent, u64 timeout)
+ 	{
+ 		// Convert timeout to TSC cycles. Timeout accuracy isn't super-important, only fast response when event is signaled (within 10us if possible)
+@@ -597,6 +619,23 @@ namespace vk
+ 			timeout *= (freq / 1'000'000);
+ 		}
+ 
++#ifdef __PROSPERO__
++		const int64_t spin_us = rpcs3ps5_tune(PS5_TUNE_VK_EVENT_SPIN_US);
++		const int64_t sleep_us = rpcs3ps5_tune(PS5_TUNE_VK_EVENT_SLEEP_US);
++		const u64 spin_start = freq ? utils::get_tsc() : get_system_time();
++		const u64 spin_ticks = spin_us > 0 ? static_cast<u64>(spin_us) * (freq ? (freq / 1'000'000) : 1) : 0;
++		u64 spins_tsc = 0, sleep_count = 0, prev_t = spin_start;
++		bool waited = false;
++		const auto account = [&]()
++		{
++			if (waited)
++			{
++				g_ps5_vk_event_waits.fetch_add(1, std::memory_order_relaxed);
++				g_ps5_vk_event_spin_tsc.fetch_add(spins_tsc, std::memory_order_relaxed);
++				g_ps5_vk_event_sleeps.fetch_add(sleep_count, std::memory_order_relaxed);
++			}
++		};
++#endif
+ 		u64 start = 0;
+ 
+ 		while (true)
+@@ -604,6 +643,9 @@ namespace vk
+ 			switch (const auto status = pEvent->status())
+ 			{
+ 			case VK_EVENT_SET:
++#ifdef __PROSPERO__
++				account();
++#endif
+ 				return VK_SUCCESS;
+ 			case VK_EVENT_RESET:
+ 				break;
+@@ -626,11 +668,31 @@ namespace vk
+ 					(now - start) > timeout)
+ 				{
+ 					rsx_log.error("[vulkan] vk::wait_for_event has timed out!");
++#ifdef __PROSPERO__
++					account();
++#endif
+ 					return VK_TIMEOUT;
+ 				}
+ 			}
+ 
++#ifdef __PROSPERO__
++			waited = true;
++			const u64 now_t = freq ? utils::get_tsc() : get_system_time();
++			const bool can_spin = spin_us < 0 || (now_t >= spin_start && (now_t - spin_start) <= spin_ticks);
++			if (can_spin)
++			{
++				utils::pause();
++				spins_tsc += now_t - prev_t;
++			}
++			else
++			{
++				std::this_thread::sleep_for(std::chrono::microseconds(sleep_us < 1 ? 1 : sleep_us));
++				sleep_count++;
++			}
++			prev_t = now_t;
++#else
+ 			utils::pause();
++#endif
+ 		}
+ 	}
+ }
+diff --git a/rpcs3/ps5/ps5_frontend.cpp b/rpcs3/ps5/ps5_frontend.cpp
+index d5d8b1608..71b7bcb17 100644
+--- a/rpcs3/ps5/ps5_frontend.cpp
++++ b/rpcs3/ps5/ps5_frontend.cpp
+@@ -375,6 +375,18 @@ std::string g_input_config_override;
+ cfg_input_configurations g_cfg_input_configs;
+ 
+ std::atomic<u64> g_ps5_flips{0};
++
++// GPU-wait tuning knobs and counters: app/ps5/src/ps5_tuning.c (title), RPCS3 sync.cpp, RADV (weak).
++extern "C" {
++int64_t rpcs3ps5_tune(int key);
++void rpcs3ps5_tune_refresh(void);
++const char* rpcs3ps5_tune_describe(void);
++void ps5_vk_event_stats(uint64_t* waits, uint64_t* spin_tsc, uint64_t* sleeps);
++extern uint64_t radv_ps5_stat_waits __attribute__((weak));
++extern uint64_t radv_ps5_stat_spin_ns __attribute__((weak));
++extern uint64_t radv_ps5_stat_sleeps __attribute__((weak));
++extern uint64_t radv_ps5_stat_wait_ns __attribute__((weak));
++}
+ // Per-frame timestamps for the frame-time percentiles in the FPS log line (ps5_gs_frame::flip records here).
+ namespace
+ {
+@@ -896,6 +908,10 @@ void start_watchdog()
+ 	sigaction(SIGUSR2, &action, nullptr);
+ 	g_main_heartbeat = now_ms();
+ 	g_watchdog_run = true;
++	// Load the live tuning file before the first report so the RSX pin and the spin knobs apply to this
++	// game from the start, not after the first 4 s report.
++	rpcs3ps5_tune_refresh();
++	sys_log.notice("PS5 TUNING: %s", rpcs3ps5_tune_describe());
+ 	g_watchdog = std::thread([]
+ 	{
+ 		u64 last_dump = 0;
+@@ -932,11 +948,45 @@ void start_watchdog()
+ 					sys_log.notice("PS5 mprotect: %u calls/s, %u ms/s, %u KiB/s", calls * 1000 / window_ms,
+ 						tsc * 1000 / freq * 1000 / window_ms, bytes / 1024 * 1000 / window_ms);
+ 				}
++				// Live tuning (ps5-tuning.txt): re-read it and log when it changed (a benchmark marker).
++				rpcs3ps5_tune_refresh();
++				{
++					static std::string last_tuning = rpcs3ps5_tune_describe();
++					const std::string tuning = rpcs3ps5_tune_describe();
++					if (tuning != last_tuning)
++					{
++						last_tuning = tuning;
++						sys_log.notice("PS5 TUNING: %s", tuning);
++					}
++				}
++				// GPU waits since the last report: calls, spin (ms/s), sleeps, and total wait.
++				{
++					const bool has_radv = &radv_ps5_stat_waits != nullptr;
++					const u64 rw = has_radv ? __atomic_load_n(&radv_ps5_stat_waits, __ATOMIC_RELAXED) : 0;
++					const u64 rs = has_radv ? __atomic_load_n(&radv_ps5_stat_spin_ns, __ATOMIC_RELAXED) : 0;
++					const u64 rsl = has_radv ? __atomic_load_n(&radv_ps5_stat_sleeps, __ATOMIC_RELAXED) : 0;
++					const u64 rwt = has_radv ? __atomic_load_n(&radv_ps5_stat_wait_ns, __ATOMIC_RELAXED) : 0;
++					static u64 lrw = 0, lrs = 0, lrsl = 0, lrwt = 0;
++					u64 vw = 0, vs = 0, vsl = 0;
++					ps5_vk_event_stats(&vw, &vs, &vsl);
++					static u64 lvw = 0, lvs = 0, lvsl = 0;
++					const u64 freq = std::max<u64>(utils::get_tsc_freq(), 1);
++					const u64 radv_spin_ms = (rs - lrs) / 1000000 * 1000 / window_ms;
++					const u64 radv_wait_ms = (rwt - lrwt) / 1000000 * 1000 / window_ms;
++					const u64 vk_spin_ms = (vs - lvs) * 1000 / freq * 1000 / window_ms;
++					sys_log.notice("PS5 WAITS: radv %u/s spin %u ms/s sleeps %u/s wait %u ms/s | vkevent %u/s spin %u ms/s sleeps %u/s",
++						(rw - lrw) * 1000 / window_ms, radv_spin_ms, (rsl - lrsl) * 1000 / window_ms, radv_wait_ms,
++						(vw - lvw) * 1000 / window_ms, vk_spin_ms, (vsl - lvsl) * 1000 / window_ms);
++					lrw = rw; lrs = rs; lrsl = rsl; lrwt = rwt; lvw = vw; lvs = vs; lvsl = vsl;
++				}
+ 				// Where the busiest threads spend their time: 2 s of samples every ~8 s, cycling through the top 4
+ 				// ("sys@addr" = inside libkernel/system code, called from addr)
+ 				if (++cpu_reports % 2 == 0)
+ 				{
+-					const std::string name = ps5_thread_top_name((cpu_reports / 2) % 4);
++					// Every 5th slot is the RSX thread explicitly (affinity/contention experiment); the rest
++					// are the busiest threads.
++					const u64 slot = (cpu_reports / 2) % 5;
++					const std::string name = slot == 4 ? std::string("rsx::thread") : ps5_thread_top_name(slot);
+ 					if (!name.empty())
+ 						sys_log.notice("PS5 PROFILE %s: %s", name, ps5_thread_profile(name, 400));
+ 				}
+-- 
+2.43.0
+

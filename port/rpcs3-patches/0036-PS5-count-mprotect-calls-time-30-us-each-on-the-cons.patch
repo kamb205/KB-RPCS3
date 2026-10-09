@@ -1,0 +1,108 @@
+From eb6a3a3f9e67ae7d4585efcc67472482f7a49e2c Mon Sep 17 00:00:00 2001
+From: KB <kb@kb-rpcs3.example>
+Date: Wed, 7 Oct 2026 00:32:07 +0100
+Subject: [PATCH 36/47] PS5: count mprotect calls/time (30 us each on the
+ console); profiler lists system-code addresses
+
+---
+ Utilities/Thread.cpp         | 15 ++++++++++++++-
+ rpcs3/ps5/ps5_frontend.cpp   |  9 +++++++++
+ rpcs3/util/vm_native_ps5.cpp |  7 +++++++
+ 3 files changed, 30 insertions(+), 1 deletion(-)
+
+diff --git a/Utilities/Thread.cpp b/Utilities/Thread.cpp
+index 8a628d213..cfc21d519 100644
+--- a/Utilities/Thread.cpp
++++ b/Utilities/Thread.cpp
+@@ -2860,6 +2860,7 @@ namespace
+ 	std::atomic<std::atomic<u64>*> g_ps5_sample_target{nullptr};
+ 	constexpr usz ps5_max_samples = 4096;
+ 	u64 g_ps5_samples[ps5_max_samples];
++	u64 g_ps5_sample_rips[ps5_max_samples]; // the system-code address of "sys@" samples (0 otherwise)
+ 	std::atomic<usz> g_ps5_sample_count{0};
+ 	std::vector<std::string> g_ps5_top_names; // busiest threads of the last report (g_ps5_threads_mutex)
+ 
+@@ -2889,6 +2890,7 @@ namespace
+ 						}
+ 				}
+ 				g_ps5_samples[i] = where;
++				g_ps5_sample_rips[i] = where != static_cast<u64>(mc.mc_rip) ? static_cast<u64>(mc.mc_rip) : 0;
+ 			}
+ 		}
+ 	}
+@@ -2995,7 +2997,18 @@ std::string ps5_thread_profile(const std::string& name, usz count)
+ 	for (const auto& [addr, h] : hits)
+ 		sorted.emplace_back(h, addr);
+ 	std::sort(sorted.begin(), sorted.end(), std::greater<>());
+-	std::string out = fmt::format("%u samples:", n);
++	std::unordered_map<u64, u32> rip_hits;
++	for (usz i = 0; i < n; i++)
++		if (g_ps5_sample_rips[i])
++			rip_hits[g_ps5_sample_rips[i]]++;
++	std::vector<std::pair<u32, u64>> rips;
++	for (const auto& [addr, h] : rip_hits)
++		rips.emplace_back(h, addr);
++	std::sort(rips.begin(), rips.end(), std::greater<>());
++	std::string out = "system code:";
++	for (usz i = 0; i < rips.size() && i < 8; i++)
++		fmt::append(out, " %x:%u", rips[i].second, rips[i].first);
++	fmt::append(out, " | %u samples:", n);
+ 	for (usz i = 0; i < sorted.size() && i < 60; i++)
+ 		if (sorted[i].second >> 63)
+ 			fmt::append(out, " sys@%x:%u", sorted[i].second & ~(1ull << 63), sorted[i].first);
+diff --git a/rpcs3/ps5/ps5_frontend.cpp b/rpcs3/ps5/ps5_frontend.cpp
+index d57383948..48333c43b 100644
+--- a/rpcs3/ps5/ps5_frontend.cpp
++++ b/rpcs3/ps5/ps5_frontend.cpp
+@@ -268,6 +268,7 @@ void rpcs3ps5_heartbeat(); // below: the main-thread watchdog
+ std::string ps5_thread_cpu_report(u64 window_ns, usz top); // Utilities/Thread.cpp
+ std::string ps5_thread_profile(const std::string& name, usz count);
+ std::string ps5_thread_top_name(usz i);
++namespace utils { extern std::atomic<u64> g_ps5_mprotect_calls, g_ps5_mprotect_tsc, g_ps5_mprotect_bytes; } // vm_native_ps5.cpp
+ 
+ // Waits for wrapped_op, running what was posted to the main thread meanwhile
+ void qt_events_aware_op(int repeat_duration_ms, std::function<bool()> wrapped_op)
+@@ -569,6 +570,14 @@ void start_watchdog()
+ 			if (now - last_cpu >= 4000)
+ 			{
+ 				sys_log.notice("PS5 CPU: %s", ps5_thread_cpu_report((now - last_cpu) * 1'000'000, 14));
++				{
++					const u64 calls = utils::g_ps5_mprotect_calls.exchange(0);
++					const u64 tsc = utils::g_ps5_mprotect_tsc.exchange(0);
++					const u64 bytes = utils::g_ps5_mprotect_bytes.exchange(0);
++					const u64 freq = std::max<u64>(utils::get_tsc_freq(), 1);
++					sys_log.notice("PS5 mprotect: %u calls/s, %u ms/s, %u KiB/s", calls * 1000 / std::max<u64>(now - last_cpu, 1),
++						tsc * 1000 / freq * 1000 / std::max<u64>(now - last_cpu, 1), bytes / 1024 * 1000 / std::max<u64>(now - last_cpu, 1));
++				}
+ 				// Where the busiest threads spend their time: 2 s of samples every ~8 s, cycling through the top 4
+ 				// ("sys@addr" = inside libkernel/system code, called from addr)
+ 				if (++cpu_reports % 2 == 0)
+diff --git a/rpcs3/util/vm_native_ps5.cpp b/rpcs3/util/vm_native_ps5.cpp
+index 1142540c2..7c7d10659 100644
+--- a/rpcs3/util/vm_native_ps5.cpp
++++ b/rpcs3/util/vm_native_ps5.cpp
+@@ -212,6 +212,9 @@ namespace utils
+ 		ensure(ps5_vrange_release(pointer, utils::align(size, 0x10000)) == 0);
+ 	}
+ 
++	// mprotect costs ~30 us on the console (2026-10-07, tools/syscallbench): counted for the CPU monitor
++	std::atomic<u64> g_ps5_mprotect_calls{0}, g_ps5_mprotect_tsc{0}, g_ps5_mprotect_bytes{0};
++
+ 	void memory_protect(void* pointer, usz size, protection prot)
+ 	{
+ 		if (!size)
+@@ -220,7 +223,11 @@ namespace utils
+ 		}
+ 
+ 		void* const base = page_floor(pointer, size);
++		const u64 t0 = __builtin_ia32_rdtsc();
+ 		ensure(::mprotect(base, size, to_posix(prot)) != -1);
++		g_ps5_mprotect_tsc += __builtin_ia32_rdtsc() - t0;
++		g_ps5_mprotect_calls++;
++		g_ps5_mprotect_bytes += size;
+ 	}
+ 
+ 	bool memory_lock(void*, usz)
+-- 
+2.43.0
+

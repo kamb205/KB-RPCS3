@@ -1,0 +1,28 @@
+From 56e4279921e388878b5862aabc8025d399b87173 Mon Sep 17 00:00:00 2001
+From: KB <kb@kb-rpcs3.example>
+Date: Tue, 6 Oct 2026 10:34:42 +0100
+Subject: [PATCH 19/47] PS5: write the console defaults (Vulkan renderer) into
+ config.yml
+
+---
+ rpcs3/ps5/ps5_frontend.cpp | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/rpcs3/ps5/ps5_frontend.cpp b/rpcs3/ps5/ps5_frontend.cpp
+index ba82a78f4..029ba0713 100644
+--- a/rpcs3/ps5/ps5_frontend.cpp
++++ b/rpcs3/ps5/ps5_frontend.cpp
+@@ -213,6 +213,10 @@ void apply_defaults()
+ 	g_cfg.core.spu_decoder.set(spu_decoder_type::llvm);
+ 	// A title gets 13 CPUs; each LLVM compile thread holds hundreds of MiB of the direct-memory heap
+ 	g_cfg.core.llvm_threads.set(6);
++
++	// A game boot reloads config.yml, which held RPCS3's compiled-in defaults (renderer "Null" on
++	// this build: the game ran with no picture, console run 11): the defaults above go into it
++	Emulator::SaveSettings(g_cfg.to_string(), {});
+ }
+ } // namespace
+ 
+-- 
+2.43.0
+

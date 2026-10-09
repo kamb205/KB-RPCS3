@@ -1,0 +1,81 @@
+From 80465afebe50fb44a74c4809a4dce97c219ca539 Mon Sep 17 00:00:00 2001
+From: KB <kb@kb-rpcs3.example>
+Date: Tue, 6 Oct 2026 11:31:33 +0100
+Subject: [PATCH 29/47] PS5: futex through _umtx_op (USE_FUTEX), replacing the
+ std::mutex wait fallback
+
+---
+ Utilities/sync.h      | 34 +++++++++++++++++++++++++++++++++-
+ rpcs3/util/atomic.cpp |  4 +++-
+ 2 files changed, 36 insertions(+), 2 deletions(-)
+
+diff --git a/Utilities/sync.h b/Utilities/sync.h
+index e0b8c39cc..a62781232 100644
+--- a/Utilities/sync.h
++++ b/Utilities/sync.h
+@@ -21,6 +21,13 @@
+ #include <os/os_sync_wait_on_address.h>
+ #endif
+ 
++#ifdef __PROSPERO__
++// PS5: FreeBSD's _umtx_op is the console's futex (libkernel's own threads are built on it)
++#include <sys/types.h>
++#include <sys/umtx.h>
++#include <ctime>
++#endif
++
+ #ifdef _WIN32
+ DYNAMIC_IMPORT("ntdll.dll", NtWaitForKeyedEvent, NTSTATUS(HANDLE, PVOID Key, BOOLEAN Alertable, PLARGE_INTEGER Timeout));
+ DYNAMIC_IMPORT("ntdll.dll", NtReleaseKeyedEvent, NTSTATUS(HANDLE, PVOID Key, BOOLEAN Alertable, PLARGE_INTEGER Timeout));
+@@ -76,7 +83,32 @@ enum
+ 
+ inline int futex(volatile void* uaddr, int futex_op, uint val, const timespec* timeout = nullptr, [[maybe_unused]] uint mask = 0)
+ {
+-#ifdef __linux__
++#ifdef __PROSPERO__
++	// Wait while *uaddr == val (a timeout is relative), wake up to val waiters; the bitset forms
++	// wait for any wake and wake everyone (spurious wakeups are allowed by every caller)
++	switch (futex_op)
++	{
++	case FUTEX_WAIT_PRIVATE:
++	case FUTEX_WAIT_BITSET_PRIVATE:
++	{
++		if (timeout)
++		{
++			_umtx_time ut{};
++			ut._timeout = *timeout;
++			ut._flags = 0;
++			ut._clockid = CLOCK_MONOTONIC;
++			return _umtx_op(const_cast<void*>(uaddr), UMTX_OP_WAIT_UINT_PRIVATE, val, reinterpret_cast<void*>(sizeof(ut)), &ut);
++		}
++		return _umtx_op(const_cast<void*>(uaddr), UMTX_OP_WAIT_UINT_PRIVATE, val, nullptr, nullptr);
++	}
++	case FUTEX_WAKE_PRIVATE:
++		return _umtx_op(const_cast<void*>(uaddr), UMTX_OP_WAKE_PRIVATE, val, nullptr, nullptr);
++	case FUTEX_WAKE_BITSET_PRIVATE:
++		return _umtx_op(const_cast<void*>(uaddr), UMTX_OP_WAKE_PRIVATE, INT32_MAX, nullptr, nullptr);
++	}
++	errno = EINVAL;
++	return -1;
++#elif defined(__linux__)
+ 	return syscall(SYS_futex, uaddr, futex_op, static_cast<int>(val), timeout, nullptr, static_cast<int>(mask));
+ #elif __APPLE__
+ 	switch (futex_op)
+diff --git a/rpcs3/util/atomic.cpp b/rpcs3/util/atomic.cpp
+index e1503ac01..d73d5430b 100644
+--- a/rpcs3/util/atomic.cpp
++++ b/rpcs3/util/atomic.cpp
+@@ -6,7 +6,9 @@
+ const bool utils::g_atomic_lse2 = utils::has_lse2();
+ #endif
+ 
+-#if defined(__linux__) || defined(__APPLE__)
++// PS5: the futex is _umtx_op (Utilities/sync.h). The std::mutex fallback aborted: a notifier locked
++// a cond handle's mutex as its waiter destroyed it, and the console's lock failed (WWE 12, run 3)
++#if defined(__linux__) || defined(__APPLE__) || defined(__PROSPERO__)
+ #define USE_FUTEX
+ #elif !defined(_WIN32)
+ #define USE_STD
+-- 
+2.43.0
+

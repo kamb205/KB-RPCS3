@@ -1,0 +1,43 @@
+From 6160aff9667231d8150aaf1ebaa0b8f4b1342b2f Mon Sep 17 00:00:00 2001
+From: KB <kb@kb-rpcs3.example>
+Date: Sun, 4 Oct 2026 23:40:41 +0100
+Subject: [PATCH 16/47] PS5: detailed memory_commit failure report
+
+---
+ rpcs3/util/vm_native_ps5.cpp | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/rpcs3/util/vm_native_ps5.cpp b/rpcs3/util/vm_native_ps5.cpp
+index f8b586de2..d3d6152cc 100644
+--- a/rpcs3/util/vm_native_ps5.cpp
++++ b/rpcs3/util/vm_native_ps5.cpp
+@@ -23,6 +23,7 @@
+ #include <cstdarg>
+ 
+ #include <ps5platform/shm.h>
++#include <ps5platform/kernel.h>
+ 
+ // A log that works from the first static constructor on (no stdio, no RPCS3 logging):
+ // /app0/rpcs3/ps5-boot.log, each line written with write() and fsync() so a kernel
+@@ -140,7 +141,17 @@ namespace utils
+ 			return;
+ 		}
+ 
+-		ensure(ps5_vrange_commit(pointer, size, to_ps5(prot)) == 0);
++		const int error = ps5_vrange_commit(pointer, size, to_ps5(prot));
++		if (error)
++		{
++			// Say why: the platform's code, the range, and what direct memory is left
++			size_t flexible = 0;
++			sceKernelAvailableFlexibleMemorySize(&flexible);
++			rpcs3ps5_boot_log("vm: COMMIT FAILED 0x%x at %p size 0x%llx prot %d (direct %lld MiB, flexible free %zu MiB)",
++				error, pointer, static_cast<unsigned long long>(size), to_ps5(prot),
++				static_cast<long long>(sceKernelGetDirectMemorySize() >> 20), flexible >> 20);
++			fmt::throw_exception("memory_commit(%p, 0x%x, prot=%d) failed: ps5_vrange_commit 0x%x", pointer, size, to_ps5(prot), error);
++		}
+ 	}
+ 
+ 	void memory_decommit(void* pointer, usz size, [[maybe_unused]] bool can_be_jit)
+-- 
+2.43.0
+

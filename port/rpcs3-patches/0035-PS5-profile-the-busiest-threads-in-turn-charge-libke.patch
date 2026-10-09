@@ -1,0 +1,127 @@
+From 0dc83981ad5f5ea4f8c2e1be4b9e405f8ba19bc4 Mon Sep 17 00:00:00 2001
+From: KB <kb@kb-rpcs3.example>
+Date: Wed, 7 Oct 2026 00:17:06 +0100
+Subject: [PATCH 35/47] PS5: profile the busiest threads in turn; charge
+ libkernel samples to the RPCS3 caller; log TSC frequency
+
+---
+ Utilities/Thread.cpp       | 37 +++++++++++++++++++++++++++++++++++--
+ rpcs3/ps5/ps5_frontend.cpp | 13 ++++++++++---
+ 2 files changed, 45 insertions(+), 5 deletions(-)
+
+diff --git a/Utilities/Thread.cpp b/Utilities/Thread.cpp
+index 030a15adb..8a628d213 100644
+--- a/Utilities/Thread.cpp
++++ b/Utilities/Thread.cpp
+@@ -2861,6 +2861,7 @@ namespace
+ 	constexpr usz ps5_max_samples = 4096;
+ 	u64 g_ps5_samples[ps5_max_samples];
+ 	std::atomic<usz> g_ps5_sample_count{0};
++	std::vector<std::string> g_ps5_top_names; // busiest threads of the last report (g_ps5_threads_mutex)
+ 
+ 	void ps5_cpu_signal(int, siginfo_t*, void* uct)
+ 	{
+@@ -2872,7 +2873,23 @@ namespace
+ 		{
+ 			const usz i = g_ps5_sample_count.fetch_add(1, std::memory_order_relaxed);
+ 			if (i < ps5_max_samples)
+-				g_ps5_samples[i] = static_cast<ucontext_t*>(uct)->uc_mcontext.mc_rip;
++			{
++				const auto& mc = static_cast<ucontext_t*>(uct)->uc_mcontext;
++				u64 where = mc.mc_rip;
++				// Outside the title image (libkernel etc.): record the first title return address on the stack
++				// instead, tagged with bit 63, so time spent in system calls is charged to the RPCS3 caller
++				if (where >= 0x5000000)
++				{
++					const u64* stack = reinterpret_cast<const u64*>(mc.mc_rsp);
++					for (usz k = 0; k < 48; k++)
++						if (stack[k] >= 0x400000 && stack[k] < 0x5000000)
++						{
++							where = stack[k] | (1ull << 63);
++							break;
++						}
++				}
++				g_ps5_samples[i] = where;
++			}
+ 		}
+ 	}
+ 
+@@ -2919,12 +2936,25 @@ std::string ps5_thread_cpu_report(u64 window_ns, usz top)
+ 		}
+ 	}
+ 	std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
++	{
++		std::lock_guard lock(g_ps5_threads_mutex);
++		g_ps5_top_names.clear();
++		for (usz i = 0; i < rows.size() && i < 6; i++)
++			g_ps5_top_names.push_back(rows[i].second);
++	}
+ 	std::string out = fmt::format("total %u%%", total * 100 / std::max<u64>(window_ns, 1));
+ 	for (usz i = 0; i < rows.size() && i < top; i++)
+ 		fmt::append(out, " | %s %u%%", rows[i].second, rows[i].first * 100 / std::max<u64>(window_ns, 1));
+ 	return out;
+ }
+ 
++// Name of the i-th busiest thread in the last ps5_thread_cpu_report() ("" if none)
++std::string ps5_thread_top_name(usz i)
++{
++	std::lock_guard lock(g_ps5_threads_mutex);
++	return i < g_ps5_top_names.size() ? g_ps5_top_names[i] : std::string();
++}
++
+ // Samples where the thread named `name` executes, `count` times 5 ms apart; "addr:hits ..." (most hit first),
+ // addresses as in the title image (symbolise addr-0x400000 against llvm-pie.elf)
+ std::string ps5_thread_profile(const std::string& name, usz count)
+@@ -2967,7 +2997,10 @@ std::string ps5_thread_profile(const std::string& name, usz count)
+ 	std::sort(sorted.begin(), sorted.end(), std::greater<>());
+ 	std::string out = fmt::format("%u samples:", n);
+ 	for (usz i = 0; i < sorted.size() && i < 60; i++)
+-		fmt::append(out, " %x:%u", sorted[i].second, sorted[i].first);
++		if (sorted[i].second >> 63)
++			fmt::append(out, " sys@%x:%u", sorted[i].second & ~(1ull << 63), sorted[i].first);
++		else
++			fmt::append(out, " %x:%u", sorted[i].second, sorted[i].first);
+ 	return out;
+ }
+ #endif
+diff --git a/rpcs3/ps5/ps5_frontend.cpp b/rpcs3/ps5/ps5_frontend.cpp
+index 97c2c1c97..d57383948 100644
+--- a/rpcs3/ps5/ps5_frontend.cpp
++++ b/rpcs3/ps5/ps5_frontend.cpp
+@@ -267,6 +267,7 @@ cfg_input_configurations g_cfg_input_configs;
+ void rpcs3ps5_heartbeat(); // below: the main-thread watchdog
+ std::string ps5_thread_cpu_report(u64 window_ns, usz top); // Utilities/Thread.cpp
+ std::string ps5_thread_profile(const std::string& name, usz count);
++std::string ps5_thread_top_name(usz i);
+ 
+ // Waits for wrapped_op, running what was posted to the main thread meanwhile
+ void qt_events_aware_op(int repeat_duration_ms, std::function<bool()> wrapped_op)
+@@ -559,6 +560,7 @@ void start_watchdog()
+ 		u64 last_cpu = now_ms();
+ 		u64 cpu_reports = 0;
+ 		ps5_thread_cpu_report(1, 0); // start the CPU monitor's window
++		sys_log.notice("PS5: TSC frequency %u Hz (0 = RPCS3 reads the OS clock, ~1 us per call on the console)", utils::get_tsc_freq());
+ 		while (g_watchdog_run)
+ 		{
+ 			std::this_thread::sleep_for(std::chrono::seconds(2));
+@@ -567,9 +569,14 @@ void start_watchdog()
+ 			if (now - last_cpu >= 4000)
+ 			{
+ 				sys_log.notice("PS5 CPU: %s", ps5_thread_cpu_report((now - last_cpu) * 1'000'000, 14));
+-				// Where the graphics thread spends its time (2 s of samples every ~16 s)
+-				if (++cpu_reports % 4 == 0)
+-					sys_log.notice("PS5 PROFILE rsx::thread: %s", ps5_thread_profile("rsx::thread", 400));
++				// Where the busiest threads spend their time: 2 s of samples every ~8 s, cycling through the top 4
++				// ("sys@addr" = inside libkernel/system code, called from addr)
++				if (++cpu_reports % 2 == 0)
++				{
++					const std::string name = ps5_thread_top_name((cpu_reports / 2) % 4);
++					if (!name.empty())
++						sys_log.notice("PS5 PROFILE %s: %s", name, ps5_thread_profile(name, 400));
++				}
+ 				last_cpu = now_ms();
+ 			}
+ 			if (now - g_main_heartbeat > 20000 && now - last_dump > 30000)
+-- 
+2.43.0
+

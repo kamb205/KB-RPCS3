@@ -1,0 +1,223 @@
+From c09eb1a4ecbaf385f477c522ad273625453c79a3 Mon Sep 17 00:00:00 2001
+From: KB <kb@kb-rpcs3.example>
+Date: Thu, 8 Oct 2026 11:52:13 +0100
+Subject: [PATCH 42/47] PS5: package install (unpkg, several at once,
+ progress); RPCS3 big file writes under /app0/rpcs3 go through the write
+ helper
+
+---
+ Utilities/File.cpp            | 32 ++++++++++++++++++
+ rpcs3/Emu/Cell/lv2/sys_fs.cpp | 22 ++++++++++--
+ rpcs3/ps5/ps5_frontend.cpp    | 63 +++++++++++++++++++++++++++++++++--
+ rpcs3/ps5/ps5_frontend.h      |  5 +--
+ 4 files changed, 115 insertions(+), 7 deletions(-)
+
+diff --git a/Utilities/File.cpp b/Utilities/File.cpp
+index bf0e8b404..0690208b5 100644
+--- a/Utilities/File.cpp
++++ b/Utilities/File.cpp
+@@ -306,6 +306,10 @@ static std::string path_append(std::string_view path, std::string_view more)
+ 	return result;
+ }
+ 
++#ifdef __PROSPERO__
++u64 ps5_io_write_fd(std::string_view path, int fd, const void* data, u64 offset, u64 size); // Emu/Cell/lv2/sys_fs.cpp
++#endif
++
+ namespace fs
+ {
+ 	thread_local error g_tls_error = error::ok;
+@@ -727,6 +731,11 @@ namespace fs
+ 		u64 m_raw_device_size; // Size of the raw device, 0 if it's not one: it never changes, so it's retrieved once when the file is opened
+ 
+ 	public:
++#ifdef __PROSPERO__
++		// A file written under /app0/rpcs3/: its big writes go through the write helper (sys_fs.cpp)
++		std::string m_ps5_path;
++#endif
++
+ 		unix_file(int fd, u64 raw_device_size = 0)
+ 			: m_fd(fd), m_raw_device_size(raw_device_size)
+ 		{
+@@ -816,6 +825,25 @@ namespace fs
+ 		{
+ 			u64 result = 0;
+ 
++#ifdef __PROSPERO__
++			if (!m_ps5_path.empty() && count >= 0x10000)
++			{
++				if (const auto pos = ::lseek(m_fd, 0, SEEK_CUR); pos >= 0)
++				{
++					const u64 done = ps5_io_write_fd(m_ps5_path, m_fd, buffer, static_cast<u64>(pos), count);
++					if (done)
++					{
++						::lseek(m_fd, pos + static_cast<off_t>(done), SEEK_SET);
++						result += done;
++						count -= done;
++						buffer = static_cast<const u8*>(buffer) + done;
++						if (!count)
++							return result;
++					}
++				}
++			}
++#endif
++
+ 			// For safety; see read()
+ 			while (auto r = ::write(m_fd, buffer, count))
+ 			{
+@@ -2127,6 +2155,10 @@ fs::file::file(const std::string& path, bs_t<open_mode> mode)
+ 	}
+ 
+ 	m_file = std::make_unique<unix_file>(fd);
++#ifdef __PROSPERO__
++	if (mode & fs::write && !(mode & fs::append) && path.starts_with("/app0/rpcs3/"))
++		static_cast<unix_file*>(m_file.get())->m_ps5_path = path;
++#endif
+ 
+ 	if (mode & fs::isfile && !(mode & fs::write) && get_stat().is_directory)
+ 	{
+diff --git a/rpcs3/Emu/Cell/lv2/sys_fs.cpp b/rpcs3/Emu/Cell/lv2/sys_fs.cpp
+index 2ffd2444e..cb207d423 100644
+--- a/rpcs3/Emu/Cell/lv2/sys_fs.cpp
++++ b/rpcs3/Emu/Cell/lv2/sys_fs.cpp
+@@ -939,13 +939,14 @@ namespace ps5_io
+ 		return g_sock = s;
+ 	}
+ 
+-	// Write `size` bytes at `offset` through the helper; bytes written (may be short: write the rest here)
+-	u64 write(std::string_view real_path, const fs::file& file, const uchar* data, u64 offset, u64 size)
++	// Write `size` bytes at `offset` of the open file `fd` through the helper; bytes written (may be short:
++	// write the rest here)
++	u64 write_fd(std::string_view real_path, int fd, const uchar* data, u64 offset, u64 size)
+ 	{
+ 		if (!real_path.starts_with(app_root))
+ 			return 0;
+ 		struct ::stat st{};
+-		if (::fstat(file.get_handle(), &st) != 0)
++		if (::fstat(fd, &st) != 0)
+ 			return 0;
+ 		const std::string_view rel = real_path.substr(app_root.size());
+ 
+@@ -984,6 +985,21 @@ namespace ps5_io
+ }
+ #endif
+ 
++namespace ps5_io
++{
++	u64 write(std::string_view real_path, const fs::file& file, const uchar* data, u64 offset, u64 size)
++	{
++		return write_fd(real_path, file.get_handle(), data, offset, size);
++	}
++}
++
++// RPCS3's own big file writes under /app0/rpcs3/ (package installs, caches) take the same way
++// (Utilities/File.cpp, unix_file::write): the title's own writes are throttled after ~1 GB
++u64 ps5_io_write_fd(std::string_view path, int fd, const void* data, u64 offset, u64 size)
++{
++	return ps5_io::write_fd(path, fd, static_cast<const uchar*>(data), offset, size);
++}
++
+ u64 lv2_file::op_write(const fs::file& file, vm::cptr<void> buf, u64 size, std::string_view real_path)
+ {
+ #ifdef __PROSPERO__
+diff --git a/rpcs3/ps5/ps5_frontend.cpp b/rpcs3/ps5/ps5_frontend.cpp
+index 642cadc84..e3f2a5615 100644
+--- a/rpcs3/ps5/ps5_frontend.cpp
++++ b/rpcs3/ps5/ps5_frontend.cpp
+@@ -41,6 +41,7 @@
+ #include "Loader/PUP.h"
+ #include "Loader/TAR.h"
+ #include "Loader/ISO.h"
++#include "Crypto/unpkg.h"
+ #include "Crypto/unself.h"
+ #include "Utilities/Thread.h"
+ #include "Utilities/File.h"
+@@ -716,9 +717,67 @@ extern "C" int rpcs3ps5_install_firmware(const char* pup_path)
+ 	return 0;
+ }
+ 
+-extern "C" int rpcs3ps5_install_package(const char* /*pkg_path*/)
++// PSN games, game updates and DLC (after rpcs3qt/main_window.cpp's package installation, without Qt):
++// every package in one go, as RPCS3 orders a game before its updates itself. Paths: one per line.
++extern "C" int rpcs3ps5_install_package(const char* pkg_paths)
+ {
+-	return fail("package install is not ported yet");
++	if (!pkg_paths || !*pkg_paths)
++		return fail("no package given");
++	std::deque<package_reader> readers;
++	std::vector<std::string> names;
++	for (std::string_view rest = pkg_paths; !rest.empty();)
++	{
++		const usz end = rest.find('\n');
++		const std::string path(rest.substr(0, end));
++		rest = end == umax ? std::string_view{} : rest.substr(end + 1);
++		if (path.empty())
++			continue;
++		readers.emplace_back(path);
++		if (!readers.back().is_valid())
++			return fail("not a valid PS3 package: " + path);
++		names.push_back(path.substr(path.find_last_of('/') + 1));
++	}
++	if (readers.empty())
++		return fail("no package given");
++
++	std::deque<std::string> bootable_paths;
++	package_install_result result{};
++	atomic_t<bool> finished = false;
++	named_thread worker("PKG Installer", [&]
++	{
++		result = package_reader::extract_data(readers, bootable_paths, false);
++		finished = true;
++		return result.error == package_install_result::error_type::no_error;
++	});
++
++	usz current = 0;
++	int shown = -1;
++	while (current < readers.size() && !finished)
++	{
++		const int progress = readers[current].get_progress(100);
++		if (progress != shown)
++		{
++			shown = progress;
++			host_progress(fmt::format("Installing %s (%u of %u): %d%%", names[current], current + 1, readers.size(), progress));
++		}
++		if (progress >= 100)
++		{
++			current++;
++			shown = -1;
++			continue;
++		}
++		std::this_thread::sleep_for(std::chrono::milliseconds(200));
++	}
++	const bool ok = worker();
++	if (!ok)
++	{
++		if (result.error == package_install_result::error_type::app_version)
++			return fail(fmt::format("an update needs version %s of the game, %s is installed", result.version.expected, result.version.installed));
++		return fail("the package could not be installed (see RPCS3.log)");
++	}
++	host_progress(fmt::format("Installed %u package(s)", readers.size()));
++	sys_log.success("PS5: installed %u package(s)", readers.size());
++	return 0;
+ }
+ 
+ // ---- main-thread watchdog ----
+diff --git a/rpcs3/ps5/ps5_frontend.h b/rpcs3/ps5/ps5_frontend.h
+index 72d9d931e..c7bc713ea 100644
+--- a/rpcs3/ps5/ps5_frontend.h
++++ b/rpcs3/ps5/ps5_frontend.h
+@@ -64,8 +64,9 @@ int rpcs3ps5_install_firmware(const char *pup_path);
+ // The installed firmware's version ("4.92"), or "" when none is
+ const char *rpcs3ps5_firmware_version(void);
+ 
+-// Installs one PKG into dev_hdd0. 0 on success.
+-int rpcs3ps5_install_package(const char *pkg_path);
++// Installs PKGs (PSN games, updates, DLC; one path per line, RPCS3 orders them) into dev_hdd0, reporting
++// progress through host.progress. 0 on success; rpcs3ps5_error() says why not.
++int rpcs3ps5_install_package(const char *pkg_paths);
+ 
+ // Boots a game (a disc folder, a dev_hdd0/game folder, or an EBOOT.BIN) and runs it until
+ // it ends or the player holds the touch pad for 2 s. 0 when it ran; rpcs3ps5_error() otherwise.
+-- 
+2.43.0
+

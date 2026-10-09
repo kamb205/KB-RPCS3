@@ -1,0 +1,836 @@
+From 2ba0765dc9a7f370ab137497a3d315ae605b1f66 Mon Sep 17 00:00:00 2001
+From: KB <kb@kb-rpcs3.example>
+Date: Sun, 4 Oct 2026 15:51:15 +0100
+Subject: [PATCH 03/47] PS5: frontend (callbacks, firmware install, run loop),
+ DualSense pad handler, OpenAL headers
+
+---
+ 3rdparty/CMakeLists.txt       |   1 +
+ rpcs3/CMakeLists.txt          |  13 ++
+ rpcs3/Input/pad_thread.cpp    |  33 +++-
+ rpcs3/ps5/ps5_frontend.cpp    | 361 ++++++++++++++++++++++++++++++++++
+ rpcs3/ps5/ps5_frontend.h      |  71 +++++++
+ rpcs3/ps5/ps5_gs_frame.h      |  34 ++++
+ rpcs3/ps5/ps5_pad_handler.cpp | 148 ++++++++++++++
+ rpcs3/ps5/ps5_pad_handler.h   |  41 ++++
+ 8 files changed, 698 insertions(+), 4 deletions(-)
+ create mode 100644 rpcs3/ps5/ps5_frontend.cpp
+ create mode 100644 rpcs3/ps5/ps5_frontend.h
+ create mode 100644 rpcs3/ps5/ps5_gs_frame.h
+ create mode 100644 rpcs3/ps5/ps5_pad_handler.cpp
+ create mode 100644 rpcs3/ps5/ps5_pad_handler.h
+
+diff --git a/3rdparty/CMakeLists.txt b/3rdparty/CMakeLists.txt
+index de867f812..aa2c9ecb8 100644
+--- a/3rdparty/CMakeLists.txt
++++ b/3rdparty/CMakeLists.txt
+@@ -256,6 +256,7 @@ if (NOT ANDROID AND NOT PS5)
+ else()
+ 	add_library(3rdparty_openal INTERFACE)
+ 	target_compile_definitions(3rdparty_openal INTERFACE WITHOUT_OPENAL=1)
++	target_include_directories(3rdparty_openal SYSTEM INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/OpenAL/openal-soft/include/AL)
+ endif()
+ 
+ # FAudio
+diff --git a/rpcs3/CMakeLists.txt b/rpcs3/CMakeLists.txt
+index 7b42942fb..ca54b9270 100644
+--- a/rpcs3/CMakeLists.txt
++++ b/rpcs3/CMakeLists.txt
+@@ -40,6 +40,19 @@ endif()
+ 
+ gen_git_version(${CMAKE_CURRENT_SOURCE_DIR})
+ 
++if (PS5)
++    # The PS5 frontend: RPCS3 without Qt, driven by the PS5 title (ps5/ps5_frontend.h)
++    add_library(rpcs3_ps5 STATIC
++        ps5/ps5_frontend.cpp
++        ps5/ps5_pad_handler.cpp
++        Input/pad_thread.cpp
++        Input/product_info.cpp
++        rpcs3_version.cpp
++    )
++    target_include_directories(rpcs3_ps5 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
++    target_link_libraries(rpcs3_ps5 PUBLIC rpcs3_emu)
++endif()
++
+ if (NOT ANDROID AND NOT PS5)
+     # Build rpcs3_lib
+     add_library(rpcs3_lib STATIC)
+diff --git a/rpcs3/Input/pad_thread.cpp b/rpcs3/Input/pad_thread.cpp
+index 6d9e4e939..b1d3c1493 100644
+--- a/rpcs3/Input/pad_thread.cpp
++++ b/rpcs3/Input/pad_thread.cpp
+@@ -1,11 +1,16 @@
+ #include "stdafx.h"
+ #include "pad_thread.h"
+ #include "product_info.h"
++#ifdef __PROSPERO__
++// PS5: the console's DualSense through the title; no HID pads
++#include "ps5/ps5_pad_handler.h"
++#else
+ #include "ds3_pad_handler.h"
+ #include "ds4_pad_handler.h"
+ #include "dualsense_pad_handler.h"
+ #include "skateboard_pad_handler.h"
+ #include "ps_move_handler.h"
++#endif
+ #ifdef _WIN32
+ #include "xinput_pad_handler.h"
+ #include "mm_joystick_handler.h"
+@@ -15,7 +20,7 @@
+ #ifdef HAVE_SDL3
+ #include "sdl_pad_handler.h"
+ #endif
+-#ifndef ANDROID
++#if !defined(ANDROID) && !defined(__PROSPERO__)
+ #include "keyboard_pad_handler.h"
+ #endif
+ #include "Emu/Io/Null/NullPadHandler.h"
+@@ -152,9 +157,19 @@ void pad_thread::Init()
+ 		input_log.notice("Reloaded empty pad config");
+ 	}
+ 
++#ifdef __PROSPERO__
++	// PS5: player 1 is the console's DualSense, whatever a config file says
++	g_cfg_input.player[0]->handler.set(pad_handler::dualsense);
++	g_cfg_input.player[0]->device.from_string(ps5_pad_handler::device_name);
++	{
++		std::shared_ptr<PadHandlerBase> handler;
++		pad_thread::InitPadConfig(g_cfg_input.player[0]->config, pad_handler::dualsense, handler);
++	}
++#endif
++
+ 	input_log.trace("Using pad config:\n%s", g_cfg_input);
+ 
+-#ifndef ANDROID
++#if !defined(ANDROID) && !defined(__PROSPERO__)
+ 	std::shared_ptr<keyboard_pad_handler> keyptr;
+ #endif
+ 
+@@ -177,7 +192,7 @@ void pad_thread::Init()
+ 		{
+ 			if (handler_type == pad_handler::keyboard)
+ 			{
+-#ifndef ANDROID
++#if !defined(ANDROID) && !defined(__PROSPERO__)
+ 				keyptr = std::make_shared<keyboard_pad_handler>();
+ 				keyptr->moveToThread(static_cast<QThread*>(m_curthread));
+ 				keyptr->SetTargetWindow(static_cast<QWindow*>(m_curwindow));
+@@ -857,11 +872,20 @@ std::shared_ptr<PadHandlerBase> pad_thread::GetHandler(pad_handler type)
+ 	case pad_handler::null:
+ 		return std::make_shared<NullPadHandler>();
+ 	case pad_handler::keyboard:
+-#ifdef ANDROID
++#if defined(ANDROID) || defined(__PROSPERO__)
+ 		return std::make_shared<NullPadHandler>();
+ #else
+ 		return std::make_shared<keyboard_pad_handler>();
+ #endif
++#ifdef __PROSPERO__
++	case pad_handler::dualsense:
++		return std::make_shared<ps5_pad_handler>();
++	case pad_handler::ds3:
++	case pad_handler::ds4:
++	case pad_handler::skateboard:
++	case pad_handler::move:
++		return std::make_shared<NullPadHandler>();
++#else
+ 	case pad_handler::ds3:
+ 		return std::make_shared<ds3_pad_handler>();
+ 	case pad_handler::ds4:
+@@ -872,6 +896,7 @@ std::shared_ptr<PadHandlerBase> pad_thread::GetHandler(pad_handler type)
+ 		return std::make_shared<skateboard_pad_handler>();
+ 	case pad_handler::move:
+ 		return std::make_shared<ps_move_handler>();
++#endif
+ #ifdef _WIN32
+ 	case pad_handler::xinput:
+ 		return std::make_shared<xinput_pad_handler>();
+diff --git a/rpcs3/ps5/ps5_frontend.cpp b/rpcs3/ps5/ps5_frontend.cpp
+new file mode 100644
+index 000000000..e2352395c
+--- /dev/null
++++ b/rpcs3/ps5/ps5_frontend.cpp
+@@ -0,0 +1,361 @@
++// RPCS3 PS5 - the emulator's frontend on the console (ps5_frontend.h): RPCS3's callbacks
++// without Qt (after rpcs3/headless_application.cpp and main_application.cpp), the
++// firmware installer (after rpcs3qt/main_window.cpp's HandlePupInstallation), and the run
++// loop that stands in for Qt's main thread while a game runs.
++// SPDX-License-Identifier: GPL-2.0-only
++
++#include "stdafx.h"
++#include "ps5_frontend.h"
++#include "ps5_gs_frame.h"
++
++#include "Emu/System.h"
++#include "Emu/system_config.h"
++#include "Emu/system_utils.hpp"
++#include "Emu/emu_callbacks.h"
++#include "Emu/vfs_config.h"
++#include "Emu/VFS.h"
++#include "Emu/IdManager.h"
++#include "Emu/RSX/RSXThread.h"
++#include "Emu/RSX/Null/NullGSRender.h"
++#include "Emu/RSX/VK/VKGSRender.h"
++#include "Emu/Audio/Null/NullAudioBackend.h"
++#include "Emu/Audio/Null/null_enumerator.h"
++#include "Emu/Io/Null/NullKeyboardHandler.h"
++#include "Emu/Io/Null/NullMouseHandler.h"
++#include "Emu/Io/Null/null_camera_handler.h"
++#include "Emu/Io/Null/null_music_handler.h"
++#include "Emu/Io/KeyboardHandler.h"
++#include "Emu/Io/MouseHandler.h"
++#include "Input/pad_thread.h"
++#include "Loader/PUP.h"
++#include "Loader/TAR.h"
++#include "Crypto/unself.h"
++#include "Utilities/Thread.h"
++#include "Utilities/File.h"
++#include "util/logs.hpp"
++#include "util/sysinfo.hpp"
++
++#include <cstdlib>
++#include <deque>
++#include <mutex>
++#include <thread>
++
++LOG_CHANNEL(sys_log, "SYS");
++
++namespace
++{
++rpcs3ps5_host g_host{};
++std::string g_error;
++std::string g_firmware;
++std::unique_ptr<logs::listener> g_log_file;
++
++std::mutex g_main_mutex;
++std::deque<std::pair<std::function<void()>, atomic_t<u32>*>> g_main_queue;
++
++void host_log(const std::string& line)
++{
++	if (g_host.log)
++		g_host.log(line.c_str());
++}
++
++void host_progress(const std::string& text)
++{
++	if (g_host.progress)
++		g_host.progress(text.c_str());
++}
++
++int fail(std::string text)
++{
++	g_error = std::move(text);
++	sys_log.error("PS5: %s", g_error);
++	host_log("rpcs3: error: " + g_error);
++	return -1;
++}
++
++// Runs what RPCS3 asked the main thread to do
++void pump_main_thread()
++{
++	for (;;)
++	{
++		std::pair<std::function<void()>, atomic_t<u32>*> item;
++		{
++			std::lock_guard lock(g_main_mutex);
++			if (g_main_queue.empty())
++				return;
++			item = std::move(g_main_queue.front());
++			g_main_queue.pop_front();
++		}
++		item.first();
++		if (item.second)
++		{
++			*item.second = true;
++			item.second->notify_one();
++		}
++	}
++}
++
++// Warnings and worse reach the title's log as they happen; everything goes to RPCS3.log
++struct host_listener final : logs::listener
++{
++	void log(u64 /*stamp*/, const logs::message& msg, std::string_view prefix, std::string_view text) override
++	{
++		if (msg <= logs::level::warning)
++		{
++			std::string line = "rpcs3: ";
++			line += prefix;
++			line += text;
++			host_log(line);
++		}
++	}
++};
++
++void create_callbacks()
++{
++	EmuCallbacks callbacks{};
++
++	callbacks.call_from_main_thread = [](std::function<void()> func, atomic_t<u32>* wake_up)
++	{
++		std::lock_guard lock(g_main_mutex);
++		g_main_queue.emplace_back(std::move(func), wake_up);
++	};
++	callbacks.try_to_quit = [](bool force_quit, std::function<void()> on_exit) -> bool
++	{
++		if (force_quit && on_exit)
++			on_exit();
++		return force_quit;
++	};
++	callbacks.init_gs_render = [](utils::serial* ar)
++	{
++		switch (const video_renderer type = g_cfg.video.renderer)
++		{
++		case video_renderer::null:
++			g_fxo->init<rsx::thread, named_thread<NullGSRender>>(ar);
++			break;
++		case video_renderer::vulkan:
++			g_fxo->init<rsx::thread, named_thread<VKGSRender>>(ar);
++			break;
++		default:
++			fmt::throw_exception("PS5: unsupported video renderer %s", type);
++		}
++	};
++	callbacks.get_gs_frame = []() -> std::unique_ptr<GSFrameBase> { return std::make_unique<ps5_gs_frame>(); };
++	callbacks.close_gs_frame = []() {};
++	callbacks.get_audio = []() -> std::shared_ptr<AudioBackend> { return std::make_shared<NullAudioBackend>(); };
++	callbacks.get_audio_enumerator = [](u64) -> std::shared_ptr<audio_device_enumerator> { return std::make_shared<null_enumerator>(); };
++	callbacks.init_kb_handler = []() { ensure(g_fxo->init<KeyboardHandlerBase, NullKeyboardHandler>(Emu.DeserialManager())); };
++	callbacks.init_mouse_handler = []() { ensure(g_fxo->init<MouseHandlerBase, NullMouseHandler>(Emu.DeserialManager())); };
++	callbacks.init_pad_handler = [](std::string_view title_id)
++	{
++		ensure(g_fxo->init<named_thread<pad_thread>>(nullptr, nullptr, title_id));
++	};
++	callbacks.get_camera_handler = []() -> std::shared_ptr<camera_handler_base> { return std::make_shared<null_camera_handler>(); };
++	callbacks.get_music_handler = []() -> std::shared_ptr<music_handler_base> { return std::make_shared<null_music_handler>(); };
++	callbacks.update_emu_settings = []() {};
++	callbacks.save_emu_settings = []() { Emulator::SaveSettings(g_cfg.to_string(), Emu.GetTitleID()); };
++
++	callbacks.get_msg_dialog = []() -> std::shared_ptr<MsgDialogBase> { return {}; };
++	callbacks.get_osk_dialog = []() -> std::shared_ptr<OskDialogBase> { return {}; };
++	callbacks.get_save_dialog = []() -> std::unique_ptr<SaveDialogBase> { return {}; };
++	callbacks.get_sendmessage_dialog = []() -> std::shared_ptr<SendMessageDialogBase> { return {}; };
++	callbacks.get_recvmessage_dialog = []() -> std::shared_ptr<RecvMessageDialogBase> { return {}; };
++	callbacks.get_trophy_notification_dialog = []() -> std::unique_ptr<TrophyNotificationBase> { return {}; };
++
++	callbacks.on_run = [](bool) {};
++	callbacks.on_pause = []() {};
++	callbacks.on_resume = []() {};
++	callbacks.on_stop = []() {};
++	callbacks.on_ready = []() {};
++	callbacks.on_missing_fw = []() { host_progress("PS3 system software is missing: install PS3UPDAT.PUP first"); };
++	callbacks.on_emulation_stop_no_response = [](std::shared_ptr<atomic_t<bool>>, int) {};
++	callbacks.on_save_state_progress = [](std::shared_ptr<atomic_t<bool>>, stx::shared_ptr<utils::serial>, stx::atomic_ptr<std::string>*, std::shared_ptr<void>) {};
++	callbacks.enable_disc_eject = [](bool) {};
++	callbacks.enable_disc_insert = [](bool) {};
++	callbacks.handle_taskbar_progress = [](s32, s32) {};
++	callbacks.get_localized_string = [](localized_string_id, const char*) -> std::string { return {}; };
++	callbacks.get_localized_u32string = [](localized_string_id, const char*) -> std::u32string { return {}; };
++	callbacks.get_localized_setting = [](const cfg::_base*, u32) -> std::string { return {}; };
++	callbacks.play_sound = [](const std::string&, std::optional<f32>) {};
++	callbacks.add_breakpoint = [](u32) {};
++	callbacks.display_sleep_control_supported = []() { return false; };
++	callbacks.enable_display_sleep = [](bool) {};
++	callbacks.check_microphone_permissions = []() {};
++	callbacks.make_video_source = []() { return nullptr; };
++	callbacks.enable_gamemode = [](bool) {};
++	callbacks.get_font_dirs = []() { return std::vector<std::string>{}; };
++	callbacks.on_install_pkgs = [](const std::vector<std::string>&, bool) { return false; };
++	callbacks.get_image_info = [](const std::string&, std::string&, s32&, s32&, s32&) { return false; };
++	callbacks.get_scaled_image = [](const std::string&, s32, s32, s32&, s32&, u8*, bool) { return false; };
++	callbacks.get_photo_path = [](std::string_view) { return std::string{}; };
++	callbacks.get_database_config = [](const std::string&) { return std::string{}; };
++
++	Emu.SetCallbacks(std::move(callbacks));
++}
++
++// The defaults a console without a settings screen needs
++void apply_defaults()
++{
++	g_cfg.video.renderer.set(video_renderer::vulkan);
++	g_cfg.audio.renderer.set(audio_renderer::null);
++	g_cfg.core.ppu_decoder.set(ppu_decoder_type::llvm);
++	g_cfg.core.spu_decoder.set(spu_decoder_type::llvm);
++}
++} // namespace
++
++void rpcs3ps5_read_host_pad(rpcs3ps5_pad* pad)
++{
++	if (g_host.read_pad)
++		g_host.read_pad(pad);
++	else
++		*pad = {};
++}
++
++// rpcs3.cpp's, which the PS5 build does not have
++[[noreturn]] void report_fatal_error(std::string_view text, bool /*is_html*/ = false, bool /*include_help_text*/ = true)
++{
++	host_log(fmt::format("rpcs3: FATAL: %s", text));
++	std::fprintf(stderr, "RPCS3 FATAL: %.*s\n", static_cast<int>(text.size()), text.data());
++	std::fflush(stderr);
++	std::abort();
++}
++
++extern "C" int rpcs3ps5_init(const char* root, const rpcs3ps5_host* host)
++{
++	if (host)
++		g_host = *host;
++
++	// fs::get_config_dir() and get_cache_dir() read these: <root>/rpcs3/
++	::setenv("XDG_CONFIG_HOME", root, 1);
++	::setenv("XDG_CACHE_HOME", root, 1);
++	::setenv("HOME", root, 1);
++
++	// Initialize thread pool finalizer (on first use), as rpcs3.cpp does
++	static_cast<void>(named_thread("", [](int) {}));
++
++	g_log_file = logs::make_file_listener(fs::get_cache_dir() + "RPCS3.log", 64 * 1024 * 1024);
++	static host_listener listener;
++	logs::listener::add(&listener);
++	sys_log.always()("RPCS3 PS5 frontend: config %s", fs::get_config_dir());
++
++	create_callbacks();
++	Emu.SetHasGui(false);
++	Emu.SetHeadless(false);
++	Emu.SetUsr("00000001");
++	Emu.Init();
++	apply_defaults();
++
++	g_firmware = utils::get_firmware_version();
++	sys_log.always()("%s", g_firmware.empty() ? "Missing Firmware" : "Firmware version: " + g_firmware);
++	host_log("rpcs3: initialised; firmware " + (g_firmware.empty() ? std::string("missing") : g_firmware));
++	return 0;
++}
++
++extern "C" const char* rpcs3ps5_firmware_version(void)
++{
++	g_firmware = utils::get_firmware_version();
++	return g_firmware.c_str();
++}
++
++extern "C" const char* rpcs3ps5_error(void)
++{
++	return g_error.c_str();
++}
++
++extern "C" int rpcs3ps5_install_firmware(const char* pup_path)
++{
++	fs::file pup_f(pup_path);
++	if (!pup_f)
++		return fail(fmt::format("cannot open %s (%s)", pup_path, fs::g_tls_error));
++
++	host_progress("Checking PS3UPDAT.PUP...");
++	pup_object pup(std::move(pup_f));
++	if (pup.operator pup_error() != pup_error::ok)
++		return fail("PS3UPDAT.PUP is not a valid PS3 update: " + pup.get_formatted_error());
++
++	fs::file update_files_f = pup.get_file(0x300);
++	if (!update_files_f || !update_files_f.size())
++		return fail("PS3UPDAT.PUP holds no installation packages");
++
++	tar_object update_files(update_files_f);
++	auto update_filenames = update_files.get_filenames();
++	std::erase_if(update_filenames, [](const std::string& s) { return s.find("dev_flash_") == umax; });
++	if (update_filenames.empty())
++		return fail("PS3UPDAT.PUP holds no dev_flash packages");
++
++	std::string version_string;
++	if (fs::file version = pup.get_file(0x100))
++		version_string = version.to_string();
++	if (const usz pos = version_string.find('\n'); pos != umax)
++		version_string.erase(pos);
++
++	// tar_object::extract() writes under the mounted /dev_flash
++	vfs::mount("/dev_flash", g_cfg_vfs.get_dev_flash());
++
++	usz done = 0;
++	for (const auto& update_filename : update_filenames)
++	{
++		host_progress(fmt::format("Installing PS3 system software %s: %u of %u", version_string, done + 1, update_filenames.size()));
++		auto update_file_stream = update_files.get_file(update_filename);
++		if (update_file_stream->m_file_handler)
++			update_file_stream->m_file_handler->handle_file_op(*update_file_stream, 0, update_file_stream->get_size(umax), nullptr);
++
++		fs::file update_file = fs::make_stream(std::move(update_file_stream->data));
++		SCEDecrypter self_dec(update_file);
++		self_dec.LoadHeaders();
++		self_dec.LoadMetadata(SCEPKG_ERK, SCEPKG_RIV);
++		self_dec.DecryptData();
++
++		auto dev_flash_tar_f = self_dec.MakeFile();
++		if (dev_flash_tar_f.size() < 3)
++			return fail("firmware package " + update_filename + " could not be decrypted");
++
++		tar_object dev_flash_tar(dev_flash_tar_f[2]);
++		if (!dev_flash_tar.extract())
++			return fail("firmware package " + update_filename + " could not be extracted");
++		done++;
++	}
++
++	Emu.Init();
++	g_firmware = utils::get_firmware_version();
++	sys_log.success("Installed PS3 firmware %s", version_string);
++	host_progress("PS3 system software " + version_string + " installed");
++	return 0;
++}
++
++extern "C" int rpcs3ps5_install_package(const char* /*pkg_path*/)
++{
++	return fail("package install is not ported yet");
++}
++
++extern "C" int rpcs3ps5_run(const char* path)
++{
++	g_error.clear();
++	host_progress(fmt::format("Booting %s", path));
++	sys_log.always()("PS5: booting %s", path);
++
++	const game_boot_result result = Emu.BootGame(path, "", false, cfg_mode::custom);
++	if (result != game_boot_result::no_errors)
++		return fail(fmt::format("boot failed: %s", result));
++
++	// Stand in for Qt's event loop until the game ends
++	u64 touch_held_ms = 0;
++	while (!Emu.IsStopped(true))
++	{
++		pump_main_thread();
++
++		rpcs3ps5_pad pad{};
++		if (g_host.read_pad)
++			g_host.read_pad(&pad);
++		touch_held_ms = (pad.buttons & RPCS3PS5_BTN_TOUCH) ? touch_held_ms + 5 : 0;
++		if (touch_held_ms >= 2000)
++		{
++			sys_log.always()("PS5: touch pad held, stopping");
++			host_progress("Stopping the game...");
++			Emu.GracefulShutdown(false, true);
++			touch_held_ms = 0;
++		}
++		std::this_thread::sleep_for(std::chrono::milliseconds(5));
++	}
++	pump_main_thread();
++	host_progress("");
++	return 0;
++}
+diff --git a/rpcs3/ps5/ps5_frontend.h b/rpcs3/ps5/ps5_frontend.h
+new file mode 100644
+index 000000000..67ea99b07
+--- /dev/null
++++ b/rpcs3/ps5/ps5_frontend.h
+@@ -0,0 +1,71 @@
++// RPCS3 PS5 - the emulator's interface to the PS5 title (C, so the title needs none of
++// RPCS3's headers). The title owns the console: the pad, the display between games,
++// the home screen. RPCS3 owns the display while a game runs.
++// SPDX-License-Identifier: GPL-2.0-only
++#pragma once
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++// The pad as the title reads it, once a frame
++struct rpcs3ps5_pad
++{
++	bool connected;
++	uint32_t buttons; // RPCS3PS5_BTN_*
++	uint8_t lx, ly, rx, ry; // 0..255, 128 = centre
++	uint8_t l2, r2;         // 0..255
++};
++
++enum
++{
++	RPCS3PS5_BTN_CROSS = 1u << 0,
++	RPCS3PS5_BTN_CIRCLE = 1u << 1,
++	RPCS3PS5_BTN_SQUARE = 1u << 2,
++	RPCS3PS5_BTN_TRIANGLE = 1u << 3,
++	RPCS3PS5_BTN_L1 = 1u << 4,
++	RPCS3PS5_BTN_R1 = 1u << 5,
++	RPCS3PS5_BTN_L2 = 1u << 6,
++	RPCS3PS5_BTN_R2 = 1u << 7,
++	RPCS3PS5_BTN_L3 = 1u << 8,
++	RPCS3PS5_BTN_R3 = 1u << 9,
++	RPCS3PS5_BTN_UP = 1u << 10,
++	RPCS3PS5_BTN_DOWN = 1u << 11,
++	RPCS3PS5_BTN_LEFT = 1u << 12,
++	RPCS3PS5_BTN_RIGHT = 1u << 13,
++	RPCS3PS5_BTN_START = 1u << 14,  // OPTIONS
++	RPCS3PS5_BTN_SELECT = 1u << 15, // CREATE
++	RPCS3PS5_BTN_TOUCH = 1u << 16,  // touch pad click: held 2 s ends the game
++};
++
++// What the title lends the emulator
++struct rpcs3ps5_host
++{
++	void (*read_pad)(struct rpcs3ps5_pad *pad); // the latest pad state
++	void (*log)(const char *line);              // one line to klog / the title's log
++	void (*progress)(const char *text);         // shown while installing or booting
++};
++
++// Once, before anything else: RPCS3's data under `root` (e.g. "/app0", giving /app0/rpcs3/)
++int rpcs3ps5_init(const char *root, const struct rpcs3ps5_host *host);
++
++// PS3UPDAT.PUP -> dev_flash. 0 on success; rpcs3ps5_error() says why not.
++int rpcs3ps5_install_firmware(const char *pup_path);
++// The installed firmware's version ("4.92"), or "" when none is
++const char *rpcs3ps5_firmware_version(void);
++
++// Installs one PKG into dev_hdd0. 0 on success.
++int rpcs3ps5_install_package(const char *pkg_path);
++
++// Boots a game (a disc folder, a dev_hdd0/game folder, or an EBOOT.BIN) and runs it until
++// it ends or the player holds the touch pad for 2 s. 0 when it ran; rpcs3ps5_error() otherwise.
++int rpcs3ps5_run(const char *path);
++
++const char *rpcs3ps5_error(void);
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/rpcs3/ps5/ps5_gs_frame.h b/rpcs3/ps5/ps5_gs_frame.h
+new file mode 100644
+index 000000000..f483c314c
+--- /dev/null
++++ b/rpcs3/ps5/ps5_gs_frame.h
+@@ -0,0 +1,34 @@
++// RPCS3 PS5 - RPCS3's game window on the console: the whole display, through VK_KHR_display.
++// SPDX-License-Identifier: GPL-2.0-only
++#pragma once
++
++#include "Emu/RSX/GSFrameBase.h"
++
++class ps5_gs_frame final : public GSFrameBase
++{
++public:
++	void close() override {}
++	void reset() override {}
++	bool shown() override { return true; }
++	void hide() override {}
++	void show() override {}
++	void toggle_fullscreen() override {}
++
++	void delete_context(draw_context_t) override {}
++	draw_context_t make_context() override { return nullptr; }
++	void set_current(draw_context_t) override {}
++	void flip(draw_context_t, bool) override {}
++	// The console's one display mode
++	int client_width() override { return 3840; }
++	int client_height() override { return 2160; }
++	f64 client_display_rate() override { return 60.0; }
++	bool has_alpha() override { return false; }
++
++	display_handle_t handle() const override { return nullptr; }
++
++	bool can_consume_frame() const override { return false; }
++	void present_frame(std::vector<u8>&&, u32, u32, u32, bool) const override {}
++	void take_screenshot(std::vector<u8>&&, u32, u32, bool) override {}
++
++	void update_title(double) override {}
++};
+diff --git a/rpcs3/ps5/ps5_pad_handler.cpp b/rpcs3/ps5/ps5_pad_handler.cpp
+new file mode 100644
+index 000000000..1eb2c721e
+--- /dev/null
++++ b/rpcs3/ps5/ps5_pad_handler.cpp
+@@ -0,0 +1,148 @@
++// RPCS3 PS5 - the DualSense as the PS3 pad (ps5_pad_handler.h).
++// SPDX-License-Identifier: GPL-2.0-only
++
++#include "stdafx.h"
++#include "ps5_pad_handler.h"
++#include "ps5_frontend.h"
++
++// ps5_frontend.cpp: the title's pad reader
++void rpcs3ps5_read_host_pad(rpcs3ps5_pad* pad);
++
++ps5_pad_handler::ps5_pad_handler()
++	: PadHandlerBase(pad_handler::dualsense)
++{
++	button_list =
++	{
++		{ None, "" },
++		{ Cross, "Cross" }, { Circle, "Circle" }, { Square, "Square" }, { Triangle, "Triangle" },
++		{ L1, "L1" }, { R1, "R1" }, { L2, "L2" }, { R2, "R2" }, { L3, "L3" }, { R3, "R3" },
++		{ Up, "Up" }, { Down, "Down" }, { Left, "Left" }, { Right, "Right" },
++		{ Options, "Options" }, { Create, "Create" }, { Touch, "Touch Pad" },
++		{ LSXNeg, "LS X-" }, { LSXPos, "LS X+" }, { LSYNeg, "LS Y-" }, { LSYPos, "LS Y+" },
++		{ RSXNeg, "RS X-" }, { RSXPos, "RS X+" }, { RSYNeg, "RS Y-" }, { RSYPos, "RS Y+" },
++	};
++
++	init_configs();
++
++	thumb_max = 255;
++	trigger_min = 0;
++	trigger_max = 255;
++	b_has_config = true;
++	b_has_deadzones = true;
++	m_name_string = "PS5 Pad #";
++	m_max_devices = 1;
++	m_trigger_threshold = trigger_max / 2;
++	m_thumb_threshold = thumb_max / 2;
++	m_device = std::make_shared<PadDevice>();
++}
++
++std::vector<pad_list_entry> ps5_pad_handler::list_devices()
++{
++	return { pad_list_entry(device_name, false) };
++}
++
++void ps5_pad_handler::init_config(cfg_pad* cfg)
++{
++	if (!cfg) return;
++
++	cfg->ls_left.def  = ::at32(button_list, LSXNeg);
++	cfg->ls_down.def  = ::at32(button_list, LSYNeg);
++	cfg->ls_right.def = ::at32(button_list, LSXPos);
++	cfg->ls_up.def    = ::at32(button_list, LSYPos);
++	cfg->rs_left.def  = ::at32(button_list, RSXNeg);
++	cfg->rs_down.def  = ::at32(button_list, RSYNeg);
++	cfg->rs_right.def = ::at32(button_list, RSXPos);
++	cfg->rs_up.def    = ::at32(button_list, RSYPos);
++	cfg->start.def    = ::at32(button_list, Options);
++	cfg->select.def   = ::at32(button_list, Create);
++	// The PS button belongs to the console: OPTIONS + CREATE together stand for it
++	cfg->ps.def       = cfg_pad::make_button_string(button_list, {{Options, Create}});
++	cfg->square.def   = ::at32(button_list, Square);
++	cfg->cross.def    = ::at32(button_list, Cross);
++	cfg->circle.def   = ::at32(button_list, Circle);
++	cfg->triangle.def = ::at32(button_list, Triangle);
++	cfg->left.def     = ::at32(button_list, Left);
++	cfg->down.def     = ::at32(button_list, Down);
++	cfg->right.def    = ::at32(button_list, Right);
++	cfg->up.def       = ::at32(button_list, Up);
++	cfg->r1.def       = ::at32(button_list, R1);
++	cfg->r2.def       = ::at32(button_list, R2);
++	cfg->r3.def       = ::at32(button_list, R3);
++	cfg->l1.def       = ::at32(button_list, L1);
++	cfg->l2.def       = ::at32(button_list, L2);
++	cfg->l3.def       = ::at32(button_list, L3);
++	cfg->pressure_intensity_button.def = ::at32(button_list, None);
++	cfg->analog_limiter_button.def = ::at32(button_list, None);
++	cfg->orientation_reset_button.def = ::at32(button_list, None);
++
++	cfg->lstickdeadzone.def = 30;
++	cfg->rstickdeadzone.def = 30;
++	cfg->ltriggerthreshold.def = 0;
++	cfg->rtriggerthreshold.def = 0;
++
++	cfg->from_default();
++}
++
++std::shared_ptr<PadDevice> ps5_pad_handler::get_device(const std::string& device)
++{
++	return device == device_name ? m_device : nullptr;
++}
++
++PadHandlerBase::connection ps5_pad_handler::update_connection(const std::shared_ptr<PadDevice>& /*device*/)
++{
++	rpcs3ps5_pad pad{};
++	rpcs3ps5_read_host_pad(&pad);
++	return pad.connected ? connection::connected : connection::disconnected;
++}
++
++std::unordered_map<u32, u16> ps5_pad_handler::get_button_values(const std::shared_ptr<PadDevice>& /*device*/)
++{
++	rpcs3ps5_pad pad{};
++	rpcs3ps5_read_host_pad(&pad);
++	const auto pressed = [&](u32 bit) -> u16 { return (pad.buttons & bit) ? 255 : 0; };
++
++	std::unordered_map<u32, u16> values;
++	values[Cross] = pressed(RPCS3PS5_BTN_CROSS);
++	values[Circle] = pressed(RPCS3PS5_BTN_CIRCLE);
++	values[Square] = pressed(RPCS3PS5_BTN_SQUARE);
++	values[Triangle] = pressed(RPCS3PS5_BTN_TRIANGLE);
++	values[L1] = pressed(RPCS3PS5_BTN_L1);
++	values[R1] = pressed(RPCS3PS5_BTN_R1);
++	values[L2] = pad.l2;
++	values[R2] = pad.r2;
++	values[L3] = pressed(RPCS3PS5_BTN_L3);
++	values[R3] = pressed(RPCS3PS5_BTN_R3);
++	values[Up] = pressed(RPCS3PS5_BTN_UP);
++	values[Down] = pressed(RPCS3PS5_BTN_DOWN);
++	values[Left] = pressed(RPCS3PS5_BTN_LEFT);
++	values[Right] = pressed(RPCS3PS5_BTN_RIGHT);
++	values[Options] = pressed(RPCS3PS5_BTN_START);
++	values[Create] = pressed(RPCS3PS5_BTN_SELECT);
++	values[Touch] = pressed(RPCS3PS5_BTN_TOUCH);
++
++	// Sticks: 0..255 with 128 at rest; up is the smaller value, as on the DualSense
++	values[LSXNeg] = Clamp0To255((127.5f - pad.lx) * 2.0f);
++	values[LSXPos] = Clamp0To255((pad.lx - 127.5f) * 2.0f);
++	values[LSYNeg] = Clamp0To255((pad.ly - 127.5f) * 2.0f);
++	values[LSYPos] = Clamp0To255((127.5f - pad.ly) * 2.0f);
++	values[RSXNeg] = Clamp0To255((127.5f - pad.rx) * 2.0f);
++	values[RSXPos] = Clamp0To255((pad.rx - 127.5f) * 2.0f);
++	values[RSYNeg] = Clamp0To255((pad.ry - 127.5f) * 2.0f);
++	values[RSYPos] = Clamp0To255((127.5f - pad.ry) * 2.0f);
++	return values;
++}
++
++pad_preview_values ps5_pad_handler::get_preview_values(const std::unordered_map<u32, u16>& data, const std::vector<std::string>& buttons)
++{
++	pad_preview_values preview{};
++	if (buttons.size() != preview.size())
++		return preview;
++	return {
++		::at32(data, L2),
++		::at32(data, R2),
++		buttons[3].empty() ? 0 : ::at32(data, LSXPos) - ::at32(data, LSXNeg),
++		buttons[2].empty() ? 0 : ::at32(data, LSYPos) - ::at32(data, LSYNeg),
++		buttons[1].empty() ? 0 : ::at32(data, RSXPos) - ::at32(data, RSXNeg),
++		buttons[0].empty() ? 0 : ::at32(data, RSYPos) - ::at32(data, RSYNeg),
++	};
++}
+diff --git a/rpcs3/ps5/ps5_pad_handler.h b/rpcs3/ps5/ps5_pad_handler.h
+new file mode 100644
+index 000000000..4f891550a
+--- /dev/null
++++ b/rpcs3/ps5/ps5_pad_handler.h
+@@ -0,0 +1,41 @@
++// RPCS3 PS5 - the console's own DualSense as player 1's PS3 pad, read through the title
++// (rpcs3ps5_host::read_pad). It takes the dualsense handler's place on the console.
++// SPDX-License-Identifier: GPL-2.0-only
++#pragma once
++
++#include "Emu/Io/PadHandler.h"
++
++class ps5_pad_handler final : public PadHandlerBase
++{
++public:
++	enum key : u32
++	{
++		None = 0,
++		Cross, Circle, Square, Triangle,
++		L1, R1, L2, R2, L3, R3,
++		Up, Down, Left, Right,
++		Options, Create, Touch,
++		LSXNeg, LSXPos, LSYNeg, LSYPos,
++		RSXNeg, RSXPos, RSYNeg, RSYPos,
++	};
++
++	static constexpr const char* device_name = "PS5 Pad #1";
++
++	ps5_pad_handler();
++
++	bool Init() override { m_is_init = true; return true; }
++	std::vector<pad_list_entry> list_devices() override;
++	void init_config(cfg_pad* cfg) override;
++
++private:
++	std::shared_ptr<PadDevice> m_device;
++
++	std::shared_ptr<PadDevice> get_device(const std::string& device) override;
++	bool get_is_left_trigger(const std::shared_ptr<PadDevice>&, u32 keyCode) override { return keyCode == L2; }
++	bool get_is_right_trigger(const std::shared_ptr<PadDevice>&, u32 keyCode) override { return keyCode == R2; }
++	bool get_is_left_stick(const std::shared_ptr<PadDevice>&, u32 keyCode) override { return keyCode >= LSXNeg && keyCode <= LSYPos; }
++	bool get_is_right_stick(const std::shared_ptr<PadDevice>&, u32 keyCode) override { return keyCode >= RSXNeg && keyCode <= RSYPos; }
++	PadHandlerBase::connection update_connection(const std::shared_ptr<PadDevice>& device) override;
++	std::unordered_map<u32, u16> get_button_values(const std::shared_ptr<PadDevice>& device) override;
++	pad_preview_values get_preview_values(const std::unordered_map<u32, u16>& data, const std::vector<std::string>& buttons) override;
++};
+-- 
+2.43.0
+

@@ -1,0 +1,31 @@
+From a567cdece852dae19401e229aa66cbf6328ddcf7 Mon Sep 17 00:00:00 2001
+From: KB <kb@kb-rpcs3.example>
+Date: Tue, 6 Oct 2026 10:37:59 +0100
+Subject: [PATCH 20/47] PS5: Vulkan is a supported and default renderer (else
+ fixup_settings forces Null)
+
+---
+ rpcs3/ps5/ps5_frontend.cpp | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/rpcs3/ps5/ps5_frontend.cpp b/rpcs3/ps5/ps5_frontend.cpp
+index 029ba0713..93f72bb97 100644
+--- a/rpcs3/ps5/ps5_frontend.cpp
++++ b/rpcs3/ps5/ps5_frontend.cpp
+@@ -283,6 +283,13 @@ extern "C" int rpcs3ps5_init(const char* root, const rpcs3ps5_host* host)
+ 	sys_log.always()("RPCS3 PS5 frontend: config %s", fs::get_config_dir());
+ 
+ 	create_callbacks();
++	// What main_application learns by probing (Qt's render_creator): on the console it is known.
++	// Without it RPCS3 resets the renderer to Null at every boot (fixup_settings), and the game
++	// ran without a picture (console run 12). The adapter name only has to be non-empty: an
++	// unknown name selects the first (only) GPU.
++	Emu.SetSupportedRenderers({video_renderer::null, video_renderer::vulkan});
++	Emu.SetDefaultRenderer(video_renderer::vulkan);
++	Emu.SetDefaultGraphicsAdapter("PS5 GPU (RADV)");
+ 	Emu.SetHasGui(false);
+ 	Emu.SetHeadless(false);
+ 	Emu.SetUsr("00000001");
+-- 
+2.43.0
+

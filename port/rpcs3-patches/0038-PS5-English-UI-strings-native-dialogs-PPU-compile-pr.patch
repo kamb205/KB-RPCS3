@@ -1,0 +1,616 @@
+From 7f9ba6fd6cae4dbd6812cfc7dccf7348a7313058 Mon Sep 17 00:00:00 2001
+From: KB <kb@kb-rpcs3.example>
+Date: Wed, 7 Oct 2026 12:07:15 +0100
+Subject: [PATCH 38/47] PS5: English UI strings (native dialogs, PPU compile
+ progress), save list + trophy pop-ups + null video source, survive exitspawn
+ restarts
+
+---
+ rpcs3/CMakeLists.txt        |   1 +
+ rpcs3/ps5/ps5_frontend.cpp  | 144 ++++++++++++--
+ rpcs3/ps5/ps5_localized.cpp | 375 ++++++++++++++++++++++++++++++++++++
+ 3 files changed, 501 insertions(+), 19 deletions(-)
+ create mode 100644 rpcs3/ps5/ps5_localized.cpp
+
+diff --git a/rpcs3/CMakeLists.txt b/rpcs3/CMakeLists.txt
+index 5324627c8..6924b5a36 100644
+--- a/rpcs3/CMakeLists.txt
++++ b/rpcs3/CMakeLists.txt
+@@ -48,6 +48,7 @@ if (PS5)
+         ps5/ps5_audio_backend.cpp
+         ps5/ps5_stubs.cpp
+         ps5/ps5_text_mirror.cpp
++        ps5/ps5_localized.cpp
+         Input/ps_move_tracker.cpp
+         Input/ps_move_config.cpp
+         Input/pad_thread.cpp
+diff --git a/rpcs3/ps5/ps5_frontend.cpp b/rpcs3/ps5/ps5_frontend.cpp
+index 48333c43b..38b81fd17 100644
+--- a/rpcs3/ps5/ps5_frontend.cpp
++++ b/rpcs3/ps5/ps5_frontend.cpp
+@@ -31,6 +31,10 @@
+ #include "Emu/Cell/Modules/cellOskDialog.h"
+ #include "Emu/Cell/Modules/cellSaveData.h"
+ #include "Emu/Cell/Modules/sceNpTrophy.h"
++#include "Emu/Cell/Modules/cellSysutil.h"
++#include "Emu/RSX/Overlays/overlay_manager.h"
++#include "Emu/RSX/Overlays/overlay_save_dialog.h"
++#include "Emu/RSX/Overlays/overlay_trophy_notification.h"
+ #include "util/video_source.h"
+ #include "Input/pad_thread.h"
+ #include "Emu/Io/pad_config.h"
+@@ -54,6 +58,8 @@
+ 
+ LOG_CHANNEL(sys_log, "SYS");
+ 
++std::string ps5_localized_string(localized_string_id id, const char* args); // ps5_localized.cpp
++
+ namespace
+ {
+ rpcs3ps5_host g_host{};
+@@ -64,6 +70,23 @@ std::unique_ptr<logs::listener> g_log_file;
+ std::mutex g_main_mutex;
+ std::deque<std::pair<std::function<void()>, atomic_t<u32>*>> g_main_queue;
+ 
++// UTF-8 to UTF-32 (the native dialogs draw u32 text)
++std::u32string utf8_to_u32(const std::string& text)
++{
++	std::u32string out;
++	for (usz i = 0; i < text.size();)
++	{
++		const u8 c = static_cast<u8>(text[i]);
++		const int extra = c >= 0xf0 ? 3 : c >= 0xe0 ? 2 : c >= 0xc0 ? 1 : 0;
++		char32_t code = extra == 3 ? c & 0x07 : extra == 2 ? c & 0x0f : extra == 1 ? c & 0x1f : c;
++		i++;
++		for (int k = 0; k < extra && i < text.size(); k++, i++)
++			code = (code << 6) | (static_cast<u8>(text[i]) & 0x3f);
++		out.push_back(code);
++	}
++	return out;
++}
++
+ void host_log(const std::string& line)
+ {
+ 	if (g_host.log)
+@@ -123,6 +146,63 @@ struct host_listener final : logs::listener
+ 	}
+ };
+ 
++// The save data list and trophy pop-ups in RPCS3's native interface (after rpcs3qt/save_data_dialog.cpp and
++// trophy_notification_helper.cpp, without their Qt fallbacks). With no save dialog at all every save list a
++// game opened came back as "cancelled" (load/save screens could not pick a save).
++struct ps5_save_dialog final : SaveDialogBase
++{
++	s32 ShowSaveDataList(const std::string& base_dir, std::vector<SaveDataEntry>& save_entries, s32 focused, u32 op,
++		vm::ptr<CellSaveDataListSet> listSet, bool enable_overlay) override
++	{
++		const bool use_end = sysutil_send_system_cmd(CELL_SYSUTIL_DRAWING_BEGIN, 0) >= 0;
++		s32 result = -2;
++		if (auto manager = g_fxo->try_get<rsx::overlays::display_manager>())
++		{
++			result = manager->create<rsx::overlays::save_dialog>()->show(base_dir, save_entries, focused, op, listSet, enable_overlay);
++			if (result == rsx::overlays::user_interface::selection_code::error)
++			{
++				sys_log.error("PS5: the save data list could not be shown");
++				result = -2;
++			}
++		}
++		if (use_end)
++			sysutil_send_system_cmd(CELL_SYSUTIL_DRAWING_END, 0);
++		return result;
++	}
++};
++
++// No video decoding on the console: a source that never has a frame. The native interface then shows the
++// still icon. video_view (save lists with ICON1.PAM, game details) ensure()s a source: none at all would
++// abort the emulator the first time a save with an animated icon was listed.
++struct ps5_null_video_source final : video_source
++{
++	void set_iso_path(const std::string&) override {}
++	void set_video_path(const std::string&, bool) override {}
++	void set_audio_path(const std::string&, bool) override {}
++	void set_active(bool active) override { m_active = active; }
++	bool get_active() const override { return m_active; }
++	bool has_new() const override { return false; }
++	void get_image(std::vector<u8>& data, int& w, int& h, int& ch, int& bpp) override
++	{
++		data.clear();
++		w = h = ch = bpp = 0;
++	}
++	bool m_active = false;
++};
++
++struct ps5_trophy_notification final : TrophyNotificationBase
++{
++	s32 ShowTrophyNotification(const SceNpTrophyDetails& trophy, const std::vector<uchar>& icon) override
++	{
++		if (auto manager = g_fxo->try_get<rsx::overlays::display_manager>())
++		{
++			auto popup = std::make_shared<rsx::overlays::trophy_notification>();
++			return manager->add(popup, false)->show(trophy, icon);
++		}
++		return 0;
++	}
++};
++
+ void create_callbacks()
+ {
+ 	emu_callbacks& callbacks = g_emu_callbacks;
+@@ -174,8 +254,8 @@ void create_callbacks()
+ 
+ 	callbacks.get_msg_dialog = []() -> std::shared_ptr<MsgDialogBase> { return {}; };
+ 	callbacks.get_osk_dialog = []() -> std::shared_ptr<OskDialogBase> { return {}; };
+-	callbacks.get_save_dialog = []() -> std::unique_ptr<SaveDialogBase> { return {}; };
+-	callbacks.get_trophy_notification_dialog = []() -> std::unique_ptr<TrophyNotificationBase> { return {}; };
++	callbacks.get_save_dialog = []() -> std::unique_ptr<SaveDialogBase> { return std::make_unique<ps5_save_dialog>(); };
++	callbacks.get_trophy_notification_dialog = []() -> std::unique_ptr<TrophyNotificationBase> { return std::make_unique<ps5_trophy_notification>(); };
+ 
+ 	callbacks.on_run = [](bool) {};
+ 	callbacks.on_pause = []() {};
+@@ -188,15 +268,17 @@ void create_callbacks()
+ 	callbacks.enable_disc_eject = [](bool) {};
+ 	callbacks.enable_disc_insert = [](bool) {};
+ 	callbacks.handle_taskbar_progress = [](s32, s32) {};
+-	callbacks.get_localized_string = [](localized_string_id, const char*) -> std::string { return {}; };
+-	callbacks.get_localized_u32string = [](localized_string_id, const char*) -> std::u32string { return {}; };
++	// The English strings (ps5_localized.cpp): empty ones left every native dialog blank and kept the
++	// "Compiling PPU modules" progress from ever showing (first boots looked frozen)
++	callbacks.get_localized_string = [](localized_string_id id, const char* args) -> std::string { return ps5_localized_string(id, args); };
++	callbacks.get_localized_u32string = [](localized_string_id id, const char* args) -> std::u32string { return utf8_to_u32(ps5_localized_string(id, args)); };
+ 	callbacks.get_localized_setting = [](const cfg::_base*, u32) -> std::string { return {}; };
+ 	callbacks.play_sound = [](const std::string&, std::optional<f32>) {};
+ 	callbacks.add_breakpoint = [](u32) {};
+ 	callbacks.display_sleep_control_supported = []() { return false; };
+ 	callbacks.enable_display_sleep = [](bool) {};
+ 	callbacks.check_microphone_permissions = []() {};
+-	callbacks.make_video_source = []() { return nullptr; };
++	callbacks.make_video_source = []() -> std::unique_ptr<video_source> { return std::make_unique<ps5_null_video_source>(); };
+ 	callbacks.enable_gamemode = [](bool) {};
+ 	callbacks.get_font_dirs = []() { return std::vector<std::string>{}; };
+ 	callbacks.on_install_pkgs = [](const std::vector<std::string>&, bool) { return false; };
+@@ -633,23 +715,47 @@ extern "C" int rpcs3ps5_run(const char* path)
+ 
+ 	// Stand in for Qt's event loop until the game ends
+ 	u64 touch_held_ms = 0;
+-	while (!Emu.IsStopped(true))
++	bool stop_requested = false;
++	for (;;)
+ 	{
+-		pump_main_thread();
+-		g_main_heartbeat = now_ms();
+-
+-		rpcs3ps5_pad pad{};
+-		if (g_host.read_pad)
+-			g_host.read_pad(&pad);
+-		touch_held_ms = (pad.buttons & RPCS3PS5_BTN_TOUCH) ? touch_held_ms + 5 : 0;
+-		if (touch_held_ms >= 2000)
++		while (!Emu.IsStopped(true))
+ 		{
+-			sys_log.always()("PS5: touch pad held, stopping");
+-			host_progress("Stopping the game...");
+-			Emu.GracefulShutdown(false, true);
+-			touch_held_ms = 0;
++			pump_main_thread();
++			g_main_heartbeat = now_ms();
++
++			rpcs3ps5_pad pad{};
++			if (g_host.read_pad)
++				g_host.read_pad(&pad);
++			touch_held_ms = (pad.buttons & RPCS3PS5_BTN_TOUCH) ? touch_held_ms + 5 : 0;
++			if (touch_held_ms >= 2000 && !stop_requested)
++			{
++				sys_log.always()("PS5: touch pad held, stopping");
++				host_progress("Stopping the game...");
++				stop_requested = true;
++				Emu.GracefulShutdown(false, true);
++				touch_held_ms = 0;
++			}
++			std::this_thread::sleep_for(std::chrono::milliseconds(5));
+ 		}
+-		std::this_thread::sleep_for(std::chrono::milliseconds(5));
++		if (stop_requested)
++			break;
++		// A game may hand over to another program of its own (sys_game_process_exitspawn: GTA IV's episode menu
++		// -> the game). RPCS3 stops the emulation, then boots the next program from a main-thread callback
++		// (Emu.after_kill_callback): keep running the main thread a while, and carry on if a game comes back.
++		// Ending here instead left the next boot half done (2026-10-07: GTA IV "froze" on the main game).
++		bool restarted = false;
++		for (int i = 0; i < 1000 && !restarted; i++) // 5 s
++		{
++			pump_main_thread();
++			g_main_heartbeat = now_ms();
++			restarted = !Emu.IsStopped(true);
++			if (!restarted)
++				std::this_thread::sleep_for(std::chrono::milliseconds(5));
++		}
++		if (!restarted)
++			break;
++		sys_log.always()("PS5: the game started its next program (%s)", Emu.GetBoot());
++		host_progress("Loading...");
+ 	}
+ 	pump_main_thread();
+ 	stop_watchdog();
+diff --git a/rpcs3/ps5/ps5_localized.cpp b/rpcs3/ps5/ps5_localized.cpp
+new file mode 100644
+index 000000000..65ffa1261
+--- /dev/null
++++ b/rpcs3/ps5/ps5_localized.cpp
+@@ -0,0 +1,375 @@
++// RPCS3 PS5 - the emulator core's English UI strings without Qt: generated from rpcs3qt/localized_emu.h
++// (port tool genloc.py). Without them every native dialog (progress, save data, messages, trophies) was
++// blank and the boot-time "Compiling PPU modules" progress never appeared (2026-10-07).
++// SPDX-License-Identifier: GPL-2.0-only
++#include "stdafx.h"
++#include "Emu/localized_string_id.h"
++#include "util/types.hpp"
++#include <string>
++
++namespace
++{
++// Qt's QString::arg for one argument: the lowest-numbered %N marker(s) become the argument
++std::string arg(std::string text, const char* value)
++{
++	if (!value)
++		return text;
++	int lowest = 100;
++	for (usz i = 0; i + 1 < text.size(); i++)
++		if (text[i] == '%' && text[i + 1] >= '0' && text[i + 1] <= '9')
++			lowest = std::min(lowest, text[i + 1] - '0');
++	if (lowest == 100)
++		return text;
++	const std::string marker = {'%', static_cast<char>('0' + lowest)};
++	for (usz at = text.find(marker); at != std::string::npos; at = text.find(marker, at + std::char_traits<char>::length(value)))
++		text.replace(at, 2, value);
++	return text;
++}
++} // namespace
++
++std::string ps5_localized_string(localized_string_id id, const char* args)
++{
++	switch (id)
++	{
++	case localized_string_id::RSX_OVERLAYS_TROPHY_BRONZE: return arg("You have earned a bronze trophy.\n%0", args);
++	case localized_string_id::RSX_OVERLAYS_TROPHY_SILVER: return arg("You have earned a silver trophy.\n%0", args);
++	case localized_string_id::RSX_OVERLAYS_TROPHY_GOLD: return arg("You have earned a gold trophy.\n%0", args);
++	case localized_string_id::RSX_OVERLAYS_TROPHY_PLATINUM: return arg("You have earned a platinum trophy.\n%0", args);
++	case localized_string_id::RSX_OVERLAYS_COMPILING_SHADERS: return "Precompiling shader interpreter variants.\nPlease wait...";
++	case localized_string_id::RSX_OVERLAYS_COMPILING_SHADERS_TITLE: return "Shader Compilation";
++	case localized_string_id::RSX_OVERLAYS_COMPILING_SHADERS_VULKAN: return arg("Building base variant %0...", args);
++	case localized_string_id::RSX_OVERLAYS_COMPILING_SHADERS_OPENGL_BUILD: return arg("Building variant %0...", args);
++	case localized_string_id::RSX_OVERLAYS_COMPILING_SHADERS_OPENGL_LINK: return arg("Linking variant %0...", args);
++	case localized_string_id::RSX_OVERLAYS_COMPILING_PPU_MODULES: return "Compiling PPU Modules";
++	case localized_string_id::RSX_OVERLAYS_MSG_DIALOG_YES: return "Yes";
++	case localized_string_id::RSX_OVERLAYS_MSG_DIALOG_NO: return "No";
++	case localized_string_id::RSX_OVERLAYS_MSG_DIALOG_CANCEL: return "Back";
++	case localized_string_id::RSX_OVERLAYS_MSG_DIALOG_OK: return "OK";
++	case localized_string_id::RSX_OVERLAYS_SAVE_DIALOG_TITLE: return "Save Dialog";
++	case localized_string_id::RSX_OVERLAYS_SAVE_DIALOG_DELETE: return "Delete Save";
++	case localized_string_id::RSX_OVERLAYS_SAVE_DIALOG_LOAD: return "Load Save";
++	case localized_string_id::RSX_OVERLAYS_SAVE_DIALOG_SAVE: return "Save";
++	case localized_string_id::RSX_OVERLAYS_OSK_DIALOG_ACCEPT: return "Enter";
++	case localized_string_id::RSX_OVERLAYS_OSK_DIALOG_CANCEL: return "Back";
++	case localized_string_id::RSX_OVERLAYS_OSK_DIALOG_SPACE: return "Space";
++	case localized_string_id::RSX_OVERLAYS_OSK_DIALOG_BACKSPACE: return "Backspace";
++	case localized_string_id::RSX_OVERLAYS_OSK_DIALOG_SHIFT: return "Shift";
++	case localized_string_id::RSX_OVERLAYS_OSK_DIALOG_ENTER_TEXT: return "[Enter Text]";
++	case localized_string_id::RSX_OVERLAYS_OSK_DIALOG_ENTER_PASSWORD: return "[Enter Password]";
++	case localized_string_id::RSX_OVERLAYS_MEDIA_DIALOG_TITLE: return "Select media";
++	case localized_string_id::RSX_OVERLAYS_MEDIA_DIALOG_TITLE_PHOTO_IMPORT: return "Select photo to import";
++	case localized_string_id::RSX_OVERLAYS_MEDIA_DIALOG_EMPTY: return "No media found.";
++	case localized_string_id::RSX_OVERLAYS_LIST_SELECT: return "Enter";
++	case localized_string_id::RSX_OVERLAYS_LIST_CANCEL: return "Back";
++	case localized_string_id::RSX_OVERLAYS_LIST_DENY: return "Deny";
++	case localized_string_id::RSX_OVERLAYS_PRESSURE_INTENSITY_TOGGLED_OFF: return arg("Pressure intensity mode of player %0 disabled", args);
++	case localized_string_id::RSX_OVERLAYS_PRESSURE_INTENSITY_TOGGLED_ON: return arg("Pressure intensity mode of player %0 enabled", args);
++	case localized_string_id::RSX_OVERLAYS_ANALOG_LIMITER_TOGGLED_OFF: return arg("Analog limiter of player %0 disabled", args);
++	case localized_string_id::RSX_OVERLAYS_ANALOG_LIMITER_TOGGLED_ON: return arg("Analog limiter of player %0 enabled", args);
++	case localized_string_id::RSX_OVERLAYS_MOUSE_AND_KEYBOARD_EMULATED: return "Mouse and keyboard are now used as emulated devices.";
++	case localized_string_id::RSX_OVERLAYS_MOUSE_AND_KEYBOARD_PAD: return "Mouse and keyboard are now used as pad.";
++	case localized_string_id::CELL_GAME_ERROR_BROKEN_GAMEDATA: return "ERROR: Game data is corrupted. The application will continue.";
++	case localized_string_id::CELL_GAME_ERROR_BROKEN_HDDGAME: return "ERROR: HDD boot game is corrupted. The application will continue.";
++	case localized_string_id::CELL_GAME_ERROR_BROKEN_EXIT_GAMEDATA: return "ERROR: Game data is corrupted. The application will be terminated.";
++	case localized_string_id::CELL_GAME_ERROR_BROKEN_EXIT_HDDGAME: return "ERROR: HDD boot game is corrupted. The application will be terminated.";
++	case localized_string_id::CELL_GAME_ERROR_NOSPACE: return arg("ERROR: Not enough available space. The application will continue.\nSpace needed: %0 KB", args);
++	case localized_string_id::CELL_GAME_ERROR_NOSPACE_EXIT: return arg("ERROR: Not enough available space. The application will be terminated.\nSpace needed: %0 KB", args);
++	case localized_string_id::CELL_GAME_ERROR_DIR_NAME: return arg("Directory name: %0", args);
++	case localized_string_id::CELL_GAME_DATA_EXIT_BROKEN: return "There has been an error!\n\nPlease remove the game data for this title.";
++	case localized_string_id::CELL_HDD_GAME_EXIT_BROKEN: return "There has been an error!\n\nPlease reinstall the HDD boot game.";
++	case localized_string_id::CELL_HDD_GAME_CHECK_NOSPACE: return arg("Not enough space to create HDD boot game.\nSpace Needed: %0 KB", args);
++	case localized_string_id::CELL_HDD_GAME_CHECK_BROKEN: return arg("HDD boot game %0 is corrupt!", args);
++	case localized_string_id::CELL_HDD_GAME_CHECK_NODATA: return arg("HDD boot game %0 could not be found!", args);
++	case localized_string_id::CELL_HDD_GAME_CHECK_INVALID: return arg("Error: %0", args);
++	case localized_string_id::CELL_GAMEDATA_CHECK_NOSPACE: return arg("Not enough space to create game data.\nSpace Needed: %0 KB", args);
++	case localized_string_id::CELL_GAMEDATA_CHECK_BROKEN: return arg("The game data in %0 is corrupt!", args);
++	case localized_string_id::CELL_GAMEDATA_CHECK_NODATA: return arg("The game data in %0 could not be found!", args);
++	case localized_string_id::CELL_GAMEDATA_CHECK_INVALID: return arg("Error: %0", args);
++	case localized_string_id::CELL_MSG_DIALOG_ERROR_80010001: return arg("The resource is temporarily unavailable.\n(%0)", args);
++	case localized_string_id::CELL_MSG_DIALOG_ERROR_80010002: return arg("Invalid argument or flag.\n(%0)", args);
++	case localized_string_id::CELL_MSG_DIALOG_ERROR_80010003: return arg("The feature is not yet implemented.\n(%0)", args);
++	case localized_string_id::CELL_MSG_DIALOG_ERROR_80010004: return arg("Memory allocation failed.\n(%0)", args);
++	case localized_string_id::CELL_MSG_DIALOG_ERROR_80010005: return arg("The resource with the specified identifier does not exist.\n(%0)", args);
++	case localized_string_id::CELL_MSG_DIALOG_ERROR_80010006: return arg("The file does not exist.\n(%0)", args);
++	case localized_string_id::CELL_MSG_DIALOG_ERROR_80010007: return arg("The file is in an unrecognized format / The file is not a valid ELF file.\n(%0)", args);
++	case localized_string_id::CELL_MSG_DIALOG_ERROR_80010008: return arg("Resource deadlock is avoided.\n(%0)", args);
++	case localized_string_id::CELL_MSG_DIALOG_ERROR_80010009: return arg("Operation not permitted.\n(%0)", args);
++	case localized_string_id::CELL_MSG_DIALOG_ERROR_8001000A: return arg("The device or resource is busy.\n(%0)", args);
++	case localized_string_id::CELL_MSG_DIALOG_ERROR_8001000B: return arg("The operation is timed out.\n(%0)", args);
++	case localized_string_id::CELL_MSG_DIALOG_ERROR_8001000C: return arg("The operation is aborted.\n(%0)", args);
++	case localized_string_id::CELL_MSG_DIALOG_ERROR_8001000D: return arg("Invalid memory access.\n(%0)", args);
++	case localized_string_id::CELL_MSG_DIALOG_ERROR_8001000F: return arg("State of the target thread is invalid.\n(%0)", args);
++	case localized_string_id::CELL_MSG_DIALOG_ERROR_80010010: return arg("Alignment is invalid.\n(%0)", args);
++	case localized_string_id::CELL_MSG_DIALOG_ERROR_80010011: return arg("Shortage of the kernel resources.\n(%0)", args);
++	case localized_string_id::CELL_MSG_DIALOG_ERROR_80010012: return arg("The file is a directory.\n(%0)", args);
++	case localized_string_id::CELL_MSG_DIALOG_ERROR_80010013: return arg("Operation cancelled.\n(%0)", args);
++	case localized_string_id::CELL_MSG_DIALOG_ERROR_80010014: return arg("Entry already exists.\n(%0)", args);
++	case localized_string_id::CELL_MSG_DIALOG_ERROR_80010015: return arg("Port is already connected.\n(%0)", args);
++	case localized_string_id::CELL_MSG_DIALOG_ERROR_80010016: return arg("Port is not connected.\n(%0)", args);
++	case localized_string_id::CELL_MSG_DIALOG_ERROR_80010017: return arg("Failure in authorizing SELF. Program authentication fail.\n(%0)", args);
++	case localized_string_id::CELL_MSG_DIALOG_ERROR_80010018: return arg("The file is not MSELF.\n(%0)", args);
++	case localized_string_id::CELL_MSG_DIALOG_ERROR_80010019: return arg("System version error.\n(%0)", args);
++	case localized_string_id::CELL_MSG_DIALOG_ERROR_8001001A: return arg("Fatal system error occurred while authorizing SELF. SELF auth failure.\n(%0)", args);
++	case localized_string_id::CELL_MSG_DIALOG_ERROR_8001001B: return arg("Math domain violation.\n(%0)", args);
++	case localized_string_id::CELL_MSG_DIALOG_ERROR_8001001C: return arg("Math range violation.\n(%0)", args);
++	case localized_string_id::CELL_MSG_DIALOG_ERROR_8001001D: return arg("Illegal multi-byte sequence in input.\n(%0)", args);
++	case localized_string_id::CELL_MSG_DIALOG_ERROR_8001001E: return arg("File position error.\n(%0)", args);
++	case localized_string_id::CELL_MSG_DIALOG_ERROR_8001001F: return arg("Syscall was interrupted.\n(%0)", args);
++	case localized_string_id::CELL_MSG_DIALOG_ERROR_80010020: return arg("File too large.\n(%0)", args);
++	case localized_string_id::CELL_MSG_DIALOG_ERROR_80010021: return arg("Too many links.\n(%0)", args);
++	case localized_string_id::CELL_MSG_DIALOG_ERROR_80010022: return arg("File table overflow.\n(%0)", args);
++	case localized_string_id::CELL_MSG_DIALOG_ERROR_80010023: return arg("No space left on device.\n(%0)", args);
++	case localized_string_id::CELL_MSG_DIALOG_ERROR_80010024: return arg("Not a TTY.\n(%0)", args);
++	case localized_string_id::CELL_MSG_DIALOG_ERROR_80010025: return arg("Broken pipe.\n(%0)", args);
++	case localized_string_id::CELL_MSG_DIALOG_ERROR_80010026: return arg("Read-only filesystem.\n(%0)", args);
++	case localized_string_id::CELL_MSG_DIALOG_ERROR_80010027: return arg("Illegal seek.\n(%0)", args);
++	case localized_string_id::CELL_MSG_DIALOG_ERROR_80010028: return arg("Arg list too long.\n(%0)", args);
++	case localized_string_id::CELL_MSG_DIALOG_ERROR_80010029: return arg("Access violation.\n(%0)", args);
++	case localized_string_id::CELL_MSG_DIALOG_ERROR_8001002A: return arg("Invalid file descriptor.\n(%0)", args);
++	case localized_string_id::CELL_MSG_DIALOG_ERROR_8001002B: return arg("Filesystem mounting failed.\n(%0)", args);
++	case localized_string_id::CELL_MSG_DIALOG_ERROR_8001002C: return arg("Too many files open.\n(%0)", args);
++	case localized_string_id::CELL_MSG_DIALOG_ERROR_8001002D: return arg("No device.\n(%0)", args);
++	case localized_string_id::CELL_MSG_DIALOG_ERROR_8001002E: return arg("Not a directory.\n(%0)", args);
++	case localized_string_id::CELL_MSG_DIALOG_ERROR_8001002F: return arg("No such device or IO.\n(%0)", args);
++	case localized_string_id::CELL_MSG_DIALOG_ERROR_80010030: return arg("Cross-device link error.\n(%0)", args);
++	case localized_string_id::CELL_MSG_DIALOG_ERROR_80010031: return arg("Bad Message.\n(%0)", args);
++	case localized_string_id::CELL_MSG_DIALOG_ERROR_80010032: return arg("In progress.\n(%0)", args);
++	case localized_string_id::CELL_MSG_DIALOG_ERROR_80010033: return arg("Message size error.\n(%0)", args);
++	case localized_string_id::CELL_MSG_DIALOG_ERROR_80010034: return arg("Name too long.\n(%0)", args);
++	case localized_string_id::CELL_MSG_DIALOG_ERROR_80010035: return arg("No lock.\n(%0)", args);
++	case localized_string_id::CELL_MSG_DIALOG_ERROR_80010036: return arg("Not empty.\n(%0)", args);
++	case localized_string_id::CELL_MSG_DIALOG_ERROR_80010037: return arg("Not supported.\n(%0)", args);
++	case localized_string_id::CELL_MSG_DIALOG_ERROR_80010038: return arg("File-system specific error.\n(%0)", args);
++	case localized_string_id::CELL_MSG_DIALOG_ERROR_80010039: return arg("Overflow occurred.\n(%0)", args);
++	case localized_string_id::CELL_MSG_DIALOG_ERROR_8001003A: return arg("Filesystem not mounted.\n(%0)", args);
++	case localized_string_id::CELL_MSG_DIALOG_ERROR_8001003B: return arg("Not SData.\n(%0)", args);
++	case localized_string_id::CELL_MSG_DIALOG_ERROR_8001003C: return arg("Incorrect version in sys_load_param.\n(%0)", args);
++	case localized_string_id::CELL_MSG_DIALOG_ERROR_8001003D: return arg("Pointer is null.\n(%0)", args);
++	case localized_string_id::CELL_MSG_DIALOG_ERROR_8001003E: return arg("Pointer is null.\n(%0)", args);
++	case localized_string_id::CELL_MSG_DIALOG_ERROR_DEFAULT: return arg("An error has occurred.\n(%0)", args);
++	case localized_string_id::CELL_OSK_DIALOG_TITLE: return "On Screen Keyboard";
++	case localized_string_id::CELL_OSK_DIALOG_BUSY: return "The Home Menu can't be opened while the On Screen Keyboard is busy!";
++	case localized_string_id::CELL_SAVEDATA_CB_BROKEN: return "Error - Save data corrupted";
++	case localized_string_id::CELL_SAVEDATA_CB_FAILURE: return "Error - Failed to save or load";
++	case localized_string_id::CELL_SAVEDATA_CB_NO_DATA: return "Error - Save data cannot be found";
++	case localized_string_id::CELL_SAVEDATA_CB_NO_SPACE: return arg("Error - Insufficient free space\n\nSpace needed: %0 KB", args);
++	case localized_string_id::CELL_SAVEDATA_NO_DATA: return "There is no saved data.";
++	case localized_string_id::CELL_SAVEDATA_NEW_SAVED_DATA_TITLE: return "New Saved Data";
++	case localized_string_id::CELL_SAVEDATA_NEW_SAVED_DATA_SUB_TITLE: return "Select to create a new entry";
++	case localized_string_id::CELL_SAVEDATA_SAVE_CONFIRMATION: return "Do you want to save this data?";
++	case localized_string_id::CELL_SAVEDATA_DELETE_CONFIRMATION: return arg("Do you really want to delete this data?\n\n%0", args);
++	case localized_string_id::CELL_SAVEDATA_DELETE_SUCCESS: return arg("Successfully removed data!\n\n%0", args);
++	case localized_string_id::CELL_SAVEDATA_DELETE: return arg("Delete this data?\n\n%0", args);
++	case localized_string_id::CELL_SAVEDATA_LOAD: return arg("Load this data?\n\n%0", args);
++	case localized_string_id::CELL_SAVEDATA_OVERWRITE: return arg("Do you want to overwrite the saved data?\n\n%0", args);
++	case localized_string_id::CELL_SAVEDATA_AUTOSAVE: return "Saving...";
++	case localized_string_id::CELL_SAVEDATA_AUTOLOAD: return "Loading...";
++	case localized_string_id::CELL_CROSS_CONTROLLER_MSG: return arg("Start [%0] on the PS Vita system.\nIf you have not installed [%0], go to [Remote Play] on the PS Vita system and start [Cross-Controller] from the LiveArea™ screen.", args);
++	case localized_string_id::CELL_CROSS_CONTROLLER_FW_MSG: return "If your system software version on the PS Vita system is earlier than 1.80, you must update the system software to the latest version.";
++	case localized_string_id::CELL_NP_RECVMESSAGE_DIALOG_TITLE: return "Select Message";
++	case localized_string_id::CELL_NP_RECVMESSAGE_DIALOG_TITLE_INVITE: return "Select Invite";
++	case localized_string_id::CELL_NP_RECVMESSAGE_DIALOG_TITLE_ADD_FRIEND: return "Add Friend";
++	case localized_string_id::CELL_NP_RECVMESSAGE_DIALOG_FROM: return "From:";
++	case localized_string_id::CELL_NP_RECVMESSAGE_DIALOG_SUBJECT: return "Subject:";
++	case localized_string_id::CELL_NP_SENDMESSAGE_DIALOG_TITLE: return "Select Message To Send";
++	case localized_string_id::CELL_NP_SENDMESSAGE_DIALOG_TITLE_INVITE: return "Send Invite";
++	case localized_string_id::CELL_NP_SENDMESSAGE_DIALOG_TITLE_ADD_FRIEND: return "Add Friend";
++	case localized_string_id::CELL_NP_SENDMESSAGE_DIALOG_CONFIRMATION: return arg("Send message to %0 ?\n\nSubject:", args);
++	case localized_string_id::CELL_NP_SENDMESSAGE_DIALOG_CONFIRMATION_INVITE: return arg("Send invite to %0 ?\n\nSubject:", args);
++	case localized_string_id::CELL_NP_SENDMESSAGE_DIALOG_CONFIRMATION_ADD_FRIEND: return arg("Send friend request to %0 ?\n\nSubject:", args);
++	case localized_string_id::CELL_NP_MESSAGE_INVITE_RECEIVED: return arg("Received an invite from %0", args);
++	case localized_string_id::CELL_NP_MESSAGE_OTHER_RECEIVED: return arg("Received a message from %0", args);
++	case localized_string_id::RECORDING_ABORTED: return "Recording aborted!";
++	case localized_string_id::RPCN_NO_ERROR: return "RPCN: No Error";
++	case localized_string_id::RPCN_ERROR_INVALID_INPUT: return "RPCN: Invalid Input (Wrong Host/Port)";
++	case localized_string_id::RPCN_ERROR_WOLFSSL: return "RPCN Connection Error: WolfSSL Error";
++	case localized_string_id::RPCN_ERROR_RESOLVE: return "RPCN Connection Error: Resolve Error";
++	case localized_string_id::RPCN_ERROR_BINDING: return "RPCN Connection Error: Failed to bind to given binding IP";
++	case localized_string_id::RPCN_ERROR_CONNECT: return "RPCN Connection Error";
++	case localized_string_id::RPCN_ERROR_LOGIN_ERROR: return "RPCN Login Error: Identification Error";
++	case localized_string_id::RPCN_ERROR_ALREADY_LOGGED: return "RPCN Login Error: User Already Logged In";
++	case localized_string_id::RPCN_ERROR_INVALID_LOGIN: return "RPCN Login Error: Invalid Username";
++	case localized_string_id::RPCN_ERROR_INVALID_PASSWORD: return "RPCN Login Error: Invalid Password";
++	case localized_string_id::RPCN_ERROR_INVALID_TOKEN: return "RPCN Login Error: Invalid Token";
++	case localized_string_id::RPCN_ERROR_INVALID_PROTOCOL_VERSION: return "RPCN Misc Error: Protocol Version Error (outdated RPCS3?)";
++	case localized_string_id::RPCN_ERROR_UNKNOWN: return "RPCN: Unknown Error";
++	case localized_string_id::RPCN_SUCCESS_LOGGED_ON: return "Successfully logged on RPCN!";
++	case localized_string_id::RPCN_FRIEND_REQUEST_RECEIVED: return arg("RPCN: Received friend request: %0", args);
++	case localized_string_id::RPCN_FRIEND_ADDED: return arg("RPCN: Friend added: %0", args);
++	case localized_string_id::RPCN_FRIEND_LOST: return arg("RPCN: Friend removed: %0", args);
++	case localized_string_id::RPCN_FRIEND_LOGGED_IN: return arg("RPCN: %0 logged in", args);
++	case localized_string_id::RPCN_FRIEND_LOGGED_OUT: return arg("RPCN: %0 logged out", args);
++	case localized_string_id::HOME_MENU_TITLE: return "Home Menu";
++	case localized_string_id::HOME_MENU_EXIT_GAME: return "Exit Game";
++	case localized_string_id::HOME_MENU_RESUME: return "Resume Game";
++	case localized_string_id::HOME_MENU_FRIENDS: return "Friends";
++	case localized_string_id::HOME_MENU_FRIENDS_REQUESTS: return "Pending Friend Requests";
++	case localized_string_id::HOME_MENU_FRIENDS_GAME_INVITES: return "Game Invitations";
++	case localized_string_id::HOME_MENU_FRIENDS_BLOCKED: return "Blocked Users";
++	case localized_string_id::HOME_MENU_FRIENDS_STATUS_ONLINE: return "Online";
++	case localized_string_id::HOME_MENU_FRIENDS_STATUS_OFFLINE: return "Offline";
++	case localized_string_id::HOME_MENU_FRIENDS_STATUS_BLOCKED: return "Blocked";
++	case localized_string_id::HOME_MENU_FRIENDS_REQUEST_SENT: return "You sent a friend request";
++	case localized_string_id::HOME_MENU_FRIENDS_REQUEST_RECEIVED: return "Sent you a friend request";
++	case localized_string_id::HOME_MENU_FRIENDS_BLOCK_USER_MSG: return arg("Block this user?\n\n%0", args);
++	case localized_string_id::HOME_MENU_FRIENDS_UNBLOCK_USER_MSG: return arg("Unblock this user?\n\n%0", args);
++	case localized_string_id::HOME_MENU_FRIENDS_REMOVE_USER_MSG: return arg("Remove this user?\n\n%0", args);
++	case localized_string_id::HOME_MENU_FRIENDS_ACCEPT_REQUEST_MSG: return arg("Accept Request?\n\n%0", args);
++	case localized_string_id::HOME_MENU_FRIENDS_CANCEL_REQUEST_MSG: return arg("Cancel Request?\n\n%0", args);
++	case localized_string_id::HOME_MENU_FRIENDS_REJECT_REQUEST_MSG: return arg("Reject Request?\n\n%0", args);
++	case localized_string_id::HOME_MENU_FRIENDS_REJECT_REQUEST: return "Reject Request";
++	case localized_string_id::HOME_MENU_FRIENDS_ACCEPT_GAME_INVITE_MSG: return arg("Accept game invitation from %0?", args);
++	case localized_string_id::HOME_MENU_FRIENDS_REJECT_GAME_INVITE_MSG: return arg("Reject game invitation from %0?", args);
++	case localized_string_id::HOME_MENU_FRIENDS_REJECT_GAME_INVITE: return "Reject Invitation";
++	case localized_string_id::HOME_MENU_FRIENDS_NEXT_LIST: return "Next list";
++	case localized_string_id::HOME_MENU_RESTART: return "Restart Game";
++	case localized_string_id::HOME_MENU_SETTINGS: return "Settings";
++	case localized_string_id::HOME_MENU_SETTINGS_SAVE: return "Save custom configuration?";
++	case localized_string_id::HOME_MENU_SETTINGS_SAVE_BUTTON: return "Save";
++	case localized_string_id::HOME_MENU_SETTINGS_DISCARD: return "Discard the current settings' changes?";
++	case localized_string_id::HOME_MENU_SETTINGS_DISCARD_BUTTON: return "Discard";
++	case localized_string_id::HOME_MENU_SETTINGS_RESET_BUTTON: return "To default";
++	case localized_string_id::HOME_MENU_SETTINGS_AUDIO: return "Audio";
++	case localized_string_id::HOME_MENU_SETTINGS_AUDIO_MASTER_VOLUME: return "Master Volume";
++	case localized_string_id::HOME_MENU_SETTINGS_AUDIO_BACKEND: return "Audio Backend";
++	case localized_string_id::HOME_MENU_SETTINGS_AUDIO_BUFFERING: return "Enable Buffering";
++	case localized_string_id::HOME_MENU_SETTINGS_AUDIO_BUFFER_DURATION: return "Desired Audio Buffer Duration";
++	case localized_string_id::HOME_MENU_SETTINGS_AUDIO_TIME_STRETCHING: return "Enable Time Stretching";
++	case localized_string_id::HOME_MENU_SETTINGS_AUDIO_TIME_STRETCHING_THRESHOLD: return "Time Stretching Threshold";
++	case localized_string_id::HOME_MENU_SETTINGS_VIDEO: return "Video";
++	case localized_string_id::HOME_MENU_SETTINGS_VIDEO_VSYNC: return "VSync";
++	case localized_string_id::HOME_MENU_SETTINGS_VIDEO_FRAME_LIMIT: return "Frame Limit";
++	case localized_string_id::HOME_MENU_SETTINGS_VIDEO_ANISOTROPIC_OVERRIDE: return "Anisotropic Filter Override";
++	case localized_string_id::HOME_MENU_SETTINGS_VIDEO_OUTPUT_SCALING: return "Output Scaling";
++	case localized_string_id::HOME_MENU_SETTINGS_VIDEO_RCAS_SHARPENING: return "FidelityFX CAS Sharpening Intensity";
++	case localized_string_id::HOME_MENU_SETTINGS_VIDEO_RESOLUTION_SCALE_PERCENT: return "Resolution Scale";
++	case localized_string_id::HOME_MENU_SETTINGS_VIDEO_RESOLUTION_SCALE_THRESHOLD: return "Resolution Scale Threshold";
++	case localized_string_id::HOME_MENU_SETTINGS_VIDEO_STRETCH_TO_DISPLAY: return "Stretch To Display Area";
++	case localized_string_id::HOME_MENU_SETTINGS_VIDEO_STEREO_MODE: return "Stereo Mode";
++	case localized_string_id::HOME_MENU_SETTINGS_INPUT: return "Input";
++	case localized_string_id::HOME_MENU_SETTINGS_INPUT_BACKGROUND_INPUT: return "Background Input Enabled";
++	case localized_string_id::HOME_MENU_SETTINGS_INPUT_KEEP_PADS_CONNECTED: return "Keep Pads Connected";
++	case localized_string_id::HOME_MENU_SETTINGS_INPUT_SHOW_PS_MOVE_CURSOR: return "Show PS Move Cursor";
++	case localized_string_id::HOME_MENU_SETTINGS_INPUT_CAMERA_FLIP: return "Camera Flip";
++	case localized_string_id::HOME_MENU_SETTINGS_INPUT_PAD_MODE: return "Pad Handler Mode";
++	case localized_string_id::HOME_MENU_SETTINGS_INPUT_PAD_SLEEP: return "Pad Handler Sleep";
++	case localized_string_id::HOME_MENU_SETTINGS_INPUT_FAKE_MOVE_ROTATION_CONE_H: return "Fake PS Move Rotation Cone (Horizontal)";
++	case localized_string_id::HOME_MENU_SETTINGS_INPUT_FAKE_MOVE_ROTATION_CONE_V: return "Fake PS Move Rotation Cone (Vertical)";
++	case localized_string_id::HOME_MENU_SETTINGS_ADVANCED: return "Advanced";
++	case localized_string_id::HOME_MENU_SETTINGS_ADVANCED_PREFERRED_SPU_THREADS: return "Preferred SPU Threads";
++	case localized_string_id::HOME_MENU_SETTINGS_ADVANCED_MAX_CPU_PREEMPTIONS: return "Max Power Saving CPU-Preemptions";
++	case localized_string_id::HOME_MENU_SETTINGS_ADVANCED_ACCURATE_RSX_RESERVATION_ACCESS: return "Accurate RSX reservation access";
++	case localized_string_id::HOME_MENU_SETTINGS_ADVANCED_SLEEP_TIMERS_ACCURACY: return "Sleep Timers Accuracy";
++	case localized_string_id::HOME_MENU_SETTINGS_ADVANCED_RSX_MEMORY_TILING: return "Handle RSX Memory Tiling";
++	case localized_string_id::HOME_MENU_SETTINGS_ADVANCED_MAX_SPURS_THREADS: return "Max SPURS Threads";
++	case localized_string_id::HOME_MENU_SETTINGS_ADVANCED_DRIVER_WAKE_UP_DELAY: return "Driver Wake-Up Delay";
++	case localized_string_id::HOME_MENU_SETTINGS_ADVANCED_VBLANK_FREQUENCY: return "VBlank Frequency";
++	case localized_string_id::HOME_MENU_SETTINGS_ADVANCED_VBLANK_NTSC: return "VBlank NTSC Fixup";
++	case localized_string_id::HOME_MENU_SETTINGS_OVERLAYS: return "Overlays";
++	case localized_string_id::HOME_MENU_SETTINGS_OVERLAYS_SHOW_TROPHY_POPUPS: return "Show Trophy Popups";
++	case localized_string_id::HOME_MENU_SETTINGS_OVERLAYS_SHOW_RPCN_POPUPS: return "Show RPCN Popups";
++	case localized_string_id::HOME_MENU_SETTINGS_OVERLAYS_SHOW_SHADER_COMPILATION_HINT: return "Show Shader Compilation Hint";
++	case localized_string_id::HOME_MENU_SETTINGS_OVERLAYS_SHOW_PPU_COMPILATION_HINT: return "Show PPU Compilation Hint";
++	case localized_string_id::HOME_MENU_SETTINGS_OVERLAYS_SHOW_AUTO_SAVE_LOAD_HINT: return "Show Autosave/Autoload Hint";
++	case localized_string_id::HOME_MENU_SETTINGS_OVERLAYS_SHOW_PRESSURE_INTENSITY_TOGGLE_HINT: return "Show Pressure Intensity Toggle Hint";
++	case localized_string_id::HOME_MENU_SETTINGS_OVERLAYS_SHOW_ANALOG_LIMITER_TOGGLE_HINT: return "Show Analog Limiter Toggle Hint";
++	case localized_string_id::HOME_MENU_SETTINGS_OVERLAYS_SHOW_MOUSE_AND_KB_TOGGLE_HINT: return "Show Mouse And Keyboard Toggle Hint";
++	case localized_string_id::HOME_MENU_SETTINGS_OVERLAYS_SHOW_FATAL_ERROR_HINTS: return "Show Fatal Error Hints";
++	case localized_string_id::HOME_MENU_SETTINGS_OVERLAYS_RECORD_WITH_OVERLAYS: return "Record With Overlays";
++	case localized_string_id::HOME_MENU_SETTINGS_OVERLAYS_PLAY_MUSIC_DURING_BOOT: return "Play music during boot sequence.";
++	case localized_string_id::HOME_MENU_SETTINGS_PERFORMANCE_OVERLAY: return "Performance Overlay";
++	case localized_string_id::HOME_MENU_SETTINGS_PERFORMANCE_OVERLAY_ENABLE: return "Enable Performance Overlay";
++	case localized_string_id::HOME_MENU_SETTINGS_PERFORMANCE_OVERLAY_ENABLE_FRAMERATE_GRAPH: return "Enable Framerate Graph";
++	case localized_string_id::HOME_MENU_SETTINGS_PERFORMANCE_OVERLAY_ENABLE_FRAMETIME_GRAPH: return "Enable Frametime Graph";
++	case localized_string_id::HOME_MENU_SETTINGS_PERFORMANCE_OVERLAY_DETAIL_LEVEL: return "Detail level";
++	case localized_string_id::HOME_MENU_SETTINGS_PERFORMANCE_OVERLAY_FRAMERATE_DETAIL_LEVEL: return "Framerate Graph Detail Level";
++	case localized_string_id::HOME_MENU_SETTINGS_PERFORMANCE_OVERLAY_FRAMETIME_DETAIL_LEVEL: return "Frametime Graph Detail Level";
++	case localized_string_id::HOME_MENU_SETTINGS_PERFORMANCE_OVERLAY_FRAMERATE_DATAPOINT_COUNT: return "Framerate Datapoints";
++	case localized_string_id::HOME_MENU_SETTINGS_PERFORMANCE_OVERLAY_FRAMETIME_DATAPOINT_COUNT: return "Frametime Datapoints";
++	case localized_string_id::HOME_MENU_SETTINGS_PERFORMANCE_OVERLAY_UPDATE_INTERVAL: return "Metrics Update Interval";
++	case localized_string_id::HOME_MENU_SETTINGS_PERFORMANCE_OVERLAY_POSITION: return "Position";
++	case localized_string_id::HOME_MENU_SETTINGS_PERFORMANCE_OVERLAY_CENTER_X: return "Center Horizontally";
++	case localized_string_id::HOME_MENU_SETTINGS_PERFORMANCE_OVERLAY_CENTER_Y: return "Center Vertically";
++	case localized_string_id::HOME_MENU_SETTINGS_PERFORMANCE_OVERLAY_MARGIN_X: return "Horizontal Margin";
++	case localized_string_id::HOME_MENU_SETTINGS_PERFORMANCE_OVERLAY_MARGIN_Y: return "Vertical Margin";
++	case localized_string_id::HOME_MENU_SETTINGS_PERFORMANCE_OVERLAY_FONT_SIZE: return "Font Size";
++	case localized_string_id::HOME_MENU_SETTINGS_PERFORMANCE_OVERLAY_OPACITY: return "Opacity";
++	case localized_string_id::HOME_MENU_SETTINGS_PERFORMANCE_OVERLAY_USE_WINDOW_SPACE: return "Use Window Space";
++	case localized_string_id::HOME_MENU_SETTINGS_DEBUG: return "Debug";
++	case localized_string_id::HOME_MENU_SETTINGS_DEBUG_OVERLAY: return "Debug Overlay";
++	case localized_string_id::HOME_MENU_SETTINGS_DEBUG_INPUT_OVERLAY: return "Input Debug Overlay";
++	case localized_string_id::HOME_MENU_SETTINGS_MOUSE_DEBUG_INPUT_OVERLAY: return "Mouse Debug Overlay";
++	case localized_string_id::HOME_MENU_SETTINGS_DEBUG_DISABLE_VIDEO_OUTPUT: return "Disable Video Output";
++	case localized_string_id::HOME_MENU_SETTINGS_DEBUG_TEXTURE_LOD_BIAS: return "Texture LOD Bias Addend";
++	case localized_string_id::HOME_MENU_SETTINGS_SYSTEM_START_BIG_PICTURE_MODE: return "Open Big Picture Mode On Boot";
++	case localized_string_id::HOME_MENU_SCREENSHOT: return "Take Screenshot";
++	case localized_string_id::HOME_MENU_SAVESTATE: return "SaveState";
++	case localized_string_id::HOME_MENU_SAVESTATE_SAVE: return "Save Emulation State";
++	case localized_string_id::HOME_MENU_SAVESTATE_AND_EXIT: return "Save Emulation State And Exit";
++	case localized_string_id::HOME_MENU_RELOAD_SAVESTATE: return "Reload Last Emulation State";
++	case localized_string_id::HOME_MENU_RELOAD_SECOND_SAVESTATE: return "Reload Second-To-Last Emulation State";
++	case localized_string_id::HOME_MENU_RELOAD_THIRD_SAVESTATE: return "Reload Third-To-Last Emulation State";
++	case localized_string_id::HOME_MENU_RELOAD_FOURTH_SAVESTATE: return "Reload Fourth-To-Last Emulation State";
++	case localized_string_id::HOME_MENU_TOGGLE_FULLSCREEN: return "Toggle Fullscreen";
++	case localized_string_id::HOME_MENU_RECORDING: return "Start/Stop Recording";
++	case localized_string_id::HOME_MENU_TROPHIES: return "Trophies";
++	case localized_string_id::HOME_MENU_TROPHY_LIST_TITLE: return arg("Trophy Progress: %0", args);
++	case localized_string_id::HOME_MENU_TROPHY_LOCKED_TITLE: return arg("Locked trophy: %0", args);
++	case localized_string_id::HOME_MENU_TROPHY_HIDDEN_TITLE: return "Hidden trophy";
++	case localized_string_id::HOME_MENU_TROPHY_HIDDEN_DESCRIPTION: return "This trophy is hidden";
++	case localized_string_id::HOME_MENU_TROPHY_SHOW_HIDDEN_TROPHIES: return "Show hidden trophies";
++	case localized_string_id::HOME_MENU_TROPHY_HIDE_HIDDEN_TROPHIES: return "Hide hidden trophies";
++	case localized_string_id::HOME_MENU_TROPHY_PLATINUM_RELEVANT: return "Platinum relevant";
++	case localized_string_id::HOME_MENU_TROPHY_GRADE_BRONZE: return "Bronze";
++	case localized_string_id::HOME_MENU_TROPHY_GRADE_SILVER: return "Silver";
++	case localized_string_id::HOME_MENU_TROPHY_GRADE_GOLD: return "Gold";
++	case localized_string_id::HOME_MENU_TROPHY_GRADE_PLATINUM: return "Platinum";
++	case localized_string_id::HOME_MENU_TROPHY_SYNC_TROPHIES: return "Sync trophies";
++	case localized_string_id::HOME_MENU_TROPHY_SYNCING_TROPHIES: return "Syncing...";
++	case localized_string_id::HOME_MENU_TROPHY_SYNC_SUCCESS: return "Synced!";
++	case localized_string_id::HOME_MENU_TROPHY_SYNC_FAILED: return "Sync failed";
++	case localized_string_id::HOME_MENU_TROPHY_SORT_GAME_DEFAULT: return "Sort: Game Default";
++	case localized_string_id::HOME_MENU_TROPHY_SORT_NOT_EARNED: return "Sort: Not Earned";
++	case localized_string_id::HOME_MENU_TROPHY_SORT_EARNED_DATE: return "Sort: Earned Date";
++	case localized_string_id::HOME_MENU_TROPHY_SORT_GRADE: return "Sort: Grade";
++	case localized_string_id::AUDIO_MUTED: return "Audio muted";
++	case localized_string_id::AUDIO_UNMUTED: return "Audio unmuted";
++	case localized_string_id::AUDIO_CHANGED: return arg("Volume changed to %0", args);
++	case localized_string_id::PROGRESS_DIALOG_PROGRESS: return "Progress:";
++	case localized_string_id::PROGRESS_DIALOG_PROGRESS_ANALYZING: return "Progress: analyzing...";
++	case localized_string_id::PROGRESS_DIALOG_REMAINING: return "remaining";
++	case localized_string_id::PROGRESS_DIALOG_DONE: return "done";
++	case localized_string_id::PROGRESS_DIALOG_FILE: return "file";
++	case localized_string_id::PROGRESS_DIALOG_MODULE: return "module";
++	case localized_string_id::PROGRESS_DIALOG_OF: return "of";
++	case localized_string_id::PROGRESS_DIALOG_PLEASE_WAIT: return "Please wait";
++	case localized_string_id::PROGRESS_DIALOG_STOPPING_PLEASE_WAIT: return "Stopping. Please wait...";
++	case localized_string_id::PROGRESS_DIALOG_SAVESTATE_PLEASE_WAIT: return "Creating savestate. Please wait...";
++	case localized_string_id::PROGRESS_DIALOG_SCANNING_PPU_EXECUTABLE: return "Scanning PPU Executable...";
++	case localized_string_id::PROGRESS_DIALOG_ANALYZING_PPU_EXECUTABLE: return "Analyzing PPU Executable...";
++	case localized_string_id::PROGRESS_DIALOG_SCANNING_PPU_MODULES: return "Scanning PPU Modules...";
++	case localized_string_id::PROGRESS_DIALOG_LOADING_PPU_MODULES: return "Loading PPU Modules...";
++	case localized_string_id::PROGRESS_DIALOG_COMPILING_PPU_MODULES: return "Compiling PPU Modules...";
++	case localized_string_id::PROGRESS_DIALOG_LINKING_PPU_MODULES: return "Linking PPU Modules...";
++	case localized_string_id::PROGRESS_DIALOG_APPLYING_PPU_CODE: return "Applying PPU Code...";
++	case localized_string_id::PROGRESS_DIALOG_BUILDING_SPU_CACHE: return "Building SPU Cache...";
++	case localized_string_id::EMULATION_PAUSED_RESUME_WITH_START: return "Press and hold the START button to resume";
++	case localized_string_id::EMULATION_RESUMING: return "Resuming...!";
++	case localized_string_id::EMULATION_FROZEN: return "The PS3 application has likely crashed, you can close it.";
++	case localized_string_id::SAVESTATE_FAILED_DUE_TO_SAVEDATA: return "SaveState failed: Game saving is in progress, wait until finished.";
++	case localized_string_id::SAVESTATE_FAILED_DUE_TO_VDEC: return "SaveState failed: VDEC-based video/cutscenes are in order, wait for them to end or enable libvdec.sprx.";
++	case localized_string_id::SAVESTATE_FAILED_DUE_TO_MISSING_SPU_SETTING: return "SaveState failed: Failed to lock SPU state, enabling SPU-Compatible mode may fix it.";
++	case localized_string_id::SAVESTATE_FAILED_DUE_TO_SPU: return "SaveState failed: Failed to lock SPU state, using SPU ASMJIT will fix it.";
++	case localized_string_id::BIG_PICTURE_MODE_TITLE: return "Big Picture Mode";
++	case localized_string_id::BIG_PICTURE_MENU_GAMES: return "Games";
++	case localized_string_id::BIG_PICTURE_MENU_EXIT: return "Exit Big Picture Mode";
++	case localized_string_id::BIG_PICTURE_NO_GAMES_FOUND: return "No games found.\nAdd games in the main RPCS3 window.";
++	case localized_string_id::BIG_PICTURE_LOADING: return "Loading games...";
++	case localized_string_id::BIG_PICTURE_GAME_DETAILS_START: return "Start";
++	case localized_string_id::BIG_PICTURE_HINT_BACK: return "Back";
++	case localized_string_id::BIG_PICTURE_HINT_SELECT: return "Select";
++	case localized_string_id::INVALID: return "Invalid";
++	default: break;
++	}
++	return {};
++}
+-- 
+2.43.0
+

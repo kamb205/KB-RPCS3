@@ -1,0 +1,132 @@
+From 61d8cbbd898f76873ae9dacf2bf23c7dc01f6477 Mon Sep 17 00:00:00 2001
+From: KB <kb@kb-rpcs3.example>
+Date: Tue, 6 Oct 2026 23:17:25 +0100
+Subject: [PATCH 33/47] PS5: CPU monitor scaffolding (per-thread clock;
+ unsupported on the console, reports 0)
+
+---
+ Utilities/Thread.cpp       | 62 ++++++++++++++++++++++++++++++++++++++
+ rpcs3/ps5/ps5_frontend.cpp |  9 ++++++
+ 2 files changed, 71 insertions(+)
+
+diff --git a/Utilities/Thread.cpp b/Utilities/Thread.cpp
+index c82f47fa7..955520255 100644
+--- a/Utilities/Thread.cpp
++++ b/Utilities/Thread.cpp
+@@ -2830,6 +2830,53 @@ void thread_base::start()
+ #endif
+ }
+ 
++#ifdef __PROSPERO__
++// PS5 CPU monitor: every RPCS3 thread with its CPU-time clock, for ps5_thread_cpu_report()
++// (rpcs3/ps5/ps5_frontend.cpp logs it every few seconds while a game runs)
++namespace
++{
++	struct ps5_thread_entry
++	{
++		thread_base* base;
++		const atomic_ptr<std::string>* name; // the thread_base's name (m_tname is private)
++		clockid_t clock;
++		u64 last_ns;
++	};
++	std::mutex g_ps5_threads_mutex;
++	std::vector<ps5_thread_entry> g_ps5_threads;
++
++	u64 ps5_clock_ns(clockid_t clock)
++	{
++		timespec ts{};
++		return ::clock_gettime(clock, &ts) == 0 ? ts.tv_sec * 1'000'000'000ull + ts.tv_nsec : 0;
++	}
++}
++
++// "total 612% | PPU[0x1000000] main_thread 98% | SPU[...] 95% | ..." over the time since the last call
++std::string ps5_thread_cpu_report(u64 window_ns, usz top)
++{
++	std::vector<std::pair<u64, std::string>> rows;
++	u64 total = 0;
++	{
++		std::lock_guard lock(g_ps5_threads_mutex);
++		for (auto& e : g_ps5_threads)
++		{
++			const u64 now = ps5_clock_ns(e.clock);
++			const u64 used = now > e.last_ns ? now - e.last_ns : 0;
++			e.last_ns = now;
++			total += used;
++			if (used)
++				rows.emplace_back(used, *e.name->load());
++		}
++	}
++	std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
++	std::string out = fmt::format("total %u%%", total * 100 / std::max<u64>(window_ns, 1));
++	for (usz i = 0; i < rows.size() && i < top; i++)
++		fmt::append(out, " | %s %u%%", rows[i].second, rows[i].first * 100 / std::max<u64>(window_ns, 1));
++	return out;
++}
++#endif
++
+ void thread_base::initialize(void (*error_cb)())
+ {
+ #ifndef _WIN32
+@@ -2862,6 +2909,14 @@ void thread_base::initialize(void (*error_cb)())
+ 	// Initialize TLS variables
+ 	thread_ctrl::g_tls_this_thread = this;
+ 
++#ifdef __PROSPERO__
++	if (clockid_t clock; ::pthread_getcpuclockid(::pthread_self(), &clock) == 0)
++	{
++		std::lock_guard lock(g_ps5_threads_mutex);
++		g_ps5_threads.push_back({this, &m_tname, clock, ps5_clock_ns(clock)});
++	}
++#endif
++
+ 	thread_ctrl::g_tls_error_callback = error_cb;
+ 
+ 	g_tls_log_prefix = []
+@@ -2938,6 +2993,13 @@ void thread_base::set_name(std::string name)
+ 
+ u64 thread_base::finalize(thread_state result_state) noexcept
+ {
++#ifdef __PROSPERO__
++	{
++		std::lock_guard lock(g_ps5_threads_mutex);
++		std::erase_if(g_ps5_threads, [this](const ps5_thread_entry& e) { return e.base == this; });
++	}
++#endif
++
+ 	// Report pending errors
+ 	error_code::error_report(0, nullptr, nullptr, nullptr, nullptr);
+ 
+diff --git a/rpcs3/ps5/ps5_frontend.cpp b/rpcs3/ps5/ps5_frontend.cpp
+index 098b155cb..0360c0124 100644
+--- a/rpcs3/ps5/ps5_frontend.cpp
++++ b/rpcs3/ps5/ps5_frontend.cpp
+@@ -265,6 +265,7 @@ std::string g_input_config_override;
+ cfg_input_configurations g_cfg_input_configs;
+ 
+ void rpcs3ps5_heartbeat(); // below: the main-thread watchdog
++std::string ps5_thread_cpu_report(u64 window_ns, usz top); // Utilities/Thread.cpp
+ 
+ // Waits for wrapped_op, running what was posted to the main thread meanwhile
+ void qt_events_aware_op(int repeat_duration_ms, std::function<bool()> wrapped_op)
+@@ -554,10 +555,18 @@ void start_watchdog()
+ 	g_watchdog = std::thread([]
+ 	{
+ 		u64 last_dump = 0;
++		u64 last_cpu = now_ms();
++		ps5_thread_cpu_report(1, 0); // start the CPU monitor's window
+ 		while (g_watchdog_run)
+ 		{
+ 			std::this_thread::sleep_for(std::chrono::seconds(2));
+ 			const u64 now = now_ms();
++			// CPU monitor: each RPCS3 thread's share of a core over the last ~4 s (100% = one core)
++			if (now - last_cpu >= 4000)
++			{
++				sys_log.notice("PS5 CPU: %s", ps5_thread_cpu_report((now - last_cpu) * 1'000'000, 14));
++				last_cpu = now;
++			}
+ 			if (now - g_main_heartbeat > 20000 && now - last_dump > 30000)
+ 			{
+ 				last_dump = now;
+-- 
+2.43.0
+

@@ -1,0 +1,29 @@
+From 1cd0fcb179a201f5272744e7c3a73c0f925ce2b0 Mon Sep 17 00:00:00 2001
+From: KB <kb@kb-rpcs3.example>
+Date: Sun, 4 Oct 2026 22:25:45 +0100
+Subject: [PATCH 13/47] PS5: rsxaudio timer cancel as a bare NOTE_TRIGGER
+ (kqueue quirk)
+
+---
+ rpcs3/Emu/Cell/lv2/sys_rsxaudio.cpp | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/rpcs3/Emu/Cell/lv2/sys_rsxaudio.cpp b/rpcs3/Emu/Cell/lv2/sys_rsxaudio.cpp
+index 10ac8aa83..3807ae269 100644
+--- a/rpcs3/Emu/Cell/lv2/sys_rsxaudio.cpp
++++ b/rpcs3/Emu/Cell/lv2/sys_rsxaudio.cpp
+@@ -2108,6 +2108,11 @@ rsxaudio_periodic_tmr::rsxaudio_periodic_tmr()
+ 	EV_SET(&handle[CANCEL_ID], CANCEL_ID, EVFILT_USER, EV_ADD | EV_ENABLE | EV_CLEAR, NOTE_FFNOP, 0, nullptr);
+ 	ensure(kevent(kq, &handle[CANCEL_ID], 1, nullptr, 0, nullptr) >= 0);
+ 	handle[CANCEL_ID].fflags |= NOTE_TRIGGER;
++#ifdef __PROSPERO__
++	// PS5: a trigger re-submitted with EV_ADD does not wake a waiting kevent (PS5_PayloadSDK
++	// platform/docs/PROBE.md, "kqueue"): the cancel is sent with no flags, NOTE_TRIGGER alone
++	handle[CANCEL_ID].flags = 0;
++#endif
+ #else
+ #error "Implement"
+ #endif
+-- 
+2.43.0
+

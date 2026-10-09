@@ -1,0 +1,45 @@
+From 813172ce5da28aa2470a17f80efb3fab191f78b6 Mon Sep 17 00:00:00 2001
+From: KB <kb@kb-rpcs3.example>
+Date: Sun, 4 Oct 2026 23:33:22 +0100
+Subject: [PATCH 15/47] PS5: stack scan in the fault report
+
+---
+ Utilities/Thread.cpp | 22 ++++++++++++++++++++++
+ 1 file changed, 22 insertions(+)
+
+diff --git a/Utilities/Thread.cpp b/Utilities/Thread.cpp
+index 600150a5a..69a1fa0d1 100644
+--- a/Utilities/Thread.cpp
++++ b/Utilities/Thread.cpp
+@@ -2626,6 +2626,28 @@ static void signal_handler(int /*sig*/, siginfo_t* info, void* uct) noexcept
+ 
+ 	append_thread_name(msg);
+ 
++#if defined(__PROSPERO__) && defined(ARCH_X64)
++	{
++		// PS5: no backtrace from the console for a fault RPCS3 handles itself. A stack scan stands in:
++		// every word near the stack pointer that points into the title image (loaded at 0x400000) or
++		// into a system module (0x8_0000_0000 and up) is a likely return address. Symbolise the
++		// title ones as addr-0x400000 against the linked llvm-pie.elf.
++		const u64 rsp = RSP(context);
++		fmt::append(msg, "PS5 regs: rip=%#x rsp=%#x rbp=%#x rdi=%#x rsi=%#x rax=%#x\nPS5 stack scan:", RIP(context), rsp, *X64REG(context, 5), *X64REG(context, 7), *X64REG(context, 6), *X64REG(context, 0));
++		int found = 0;
++		for (u64 offset = 0; offset < 3072 && found < 24; offset += 8)
++		{
++			const u64 value = *reinterpret_cast<const u64*>(rsp + offset);
++			if ((value >= 0x400000 && value < 0x5000000) || (value >= 0x800000000ull && value < 0x802000000ull))
++			{
++				fmt::append(msg, " %#x", value);
++				found++;
++			}
++		}
++		msg += "\n";
++	}
++#endif
++
+ #ifdef __APPLE__
+ 	thread_local bool s_tls_is_attempting_recovery = false;
+ 	thread_local bool s_tls_last_cause_is_executing = false;
+-- 
+2.43.0
+

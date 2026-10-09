@@ -1,0 +1,66 @@
+From 2209a936666e9e638decd91d30956b6979cfb0e3 Mon Sep 17 00:00:00 2001
+From: KB <kb@kb-rpcs3.example>
+Date: Thu, 8 Oct 2026 12:06:11 +0100
+Subject: [PATCH 43/47] PS5: SPU threads one per core with the RPCS3 scheduler
+ (kPs5Sibling to confirm by the topology probe); NOT YET BUILT
+
+---
+ Utilities/Thread.cpp | 40 ++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 40 insertions(+)
+
+diff --git a/Utilities/Thread.cpp b/Utilities/Thread.cpp
+index cfc21d519..c8576cf90 100644
+--- a/Utilities/Thread.cpp
++++ b/Utilities/Thread.cpp
+@@ -3859,8 +3859,48 @@ void thread_ctrl::detect_cpu_layout()
+ 	}
+ }
+ 
++#ifdef __PROSPERO__
++// The console's CPUs for a title (13: six cores with both of their threads, one with one). With the RPCS3
++// scheduler: each SPU thread gets a core of its own (the first thread of each full core), the PPU and RSX
++// threads the cores' other threads, so two SPU threads never share a core (GTA IV is SPU-bound: 2026-10-08).
++// kPs5Sibling: the distance between a core's two CPUs (1: CPUs 0+1, 2+3, ...).
++constexpr u32 kPs5Sibling = 1;
++
++static u64 ps5_affinity_mask(thread_class group, u64 all)
++{
++	u64 firsts = 0, seconds = 0;
++	for (u32 cpu = 0; cpu < 64; cpu++)
++	{
++		if (!(all >> cpu & 1))
++			continue;
++		const bool first = (cpu / kPs5Sibling) % 2 == 0;
++		const u32 sibling = first ? cpu + kPs5Sibling : cpu - kPs5Sibling;
++		if (first && sibling < 64 && (all >> sibling & 1))
++			firsts |= 1ull << cpu;
++		else
++			seconds |= 1ull << cpu;
++	}
++	static const bool logged = [&]
++	{
++		sig_log.notice("PS5: CPUs 0x%x: SPU threads on 0x%x, PPU/RSX threads on 0x%x", all, firsts, seconds);
++		return true;
++	}();
++	(void)logged;
++	switch (group)
++	{
++	case thread_class::spu: return firsts ? firsts : all;
++	case thread_class::ppu:
++	case thread_class::rsx: return seconds ? seconds : all;
++	default: return all;
++	}
++}
++#endif
++
+ u64 thread_ctrl::get_affinity_mask(thread_class group)
+ {
++#ifdef __PROSPERO__
++	return ps5_affinity_mask(group, process_affinity_mask);
++#endif
+ 	detect_cpu_layout();
+ 
+ 	if (const auto thread_count = utils::get_thread_count())
+-- 
+2.43.0
+

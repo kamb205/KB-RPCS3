@@ -1,0 +1,64 @@
+From 4fbd04cf8857a7ff14d14165fe4eaea3063d2f7c Mon Sep 17 00:00:00 2001
+From: KB <kb@kb-rpcs3.example>
+Date: Tue, 6 Oct 2026 10:20:45 +0100
+Subject: [PATCH 18/47] PS5: anywhere reservations from 0x20_0000_0000 up
+ (direct memory refused near system modules)
+
+---
+ rpcs3/util/vm_native_ps5.cpp | 39 ++++++++++++++++++++++++++++++++----
+ 1 file changed, 35 insertions(+), 4 deletions(-)
+
+diff --git a/rpcs3/util/vm_native_ps5.cpp b/rpcs3/util/vm_native_ps5.cpp
+index d3d6152cc..7475f6948 100644
+--- a/rpcs3/util/vm_native_ps5.cpp
++++ b/rpcs3/util/vm_native_ps5.cpp
+@@ -127,11 +127,42 @@ namespace utils
+ 			return error == 0 ? use_addr : nullptr;
+ 		}
+ 
+-		void* base = nullptr;
++		// "Anywhere" starts at 0x20_0000_0000: above RPCS3's fixed guest ranges (0x10..0x1E_0000_0000),
++		// and away from 0x8_0000_0000 and up, where the system modules are loaded: a range the platform
++		// found free between them reserved fine, but direct memory could not be mapped into it
++		// (0x80020016), so LLVM's code managers failed at their first commit (console run 10).
++		// A hint in taken space moves upward (platform/docs/PROBE.md).
++		// The platform falls back to its own search from 0x4_0000_0000 when the hint is refused, so the
++		// result is checked here, and a running hint walks up 0x20..0x100_0000_0000 (1 TiB is the end).
++		static atomic_t<u64> s_next = 0x20'0000'0000ull;
+ 		rpcs3ps5_boot_log("vm: reserve 0x%llx bytes anywhere", static_cast<unsigned long long>(size));
+-		const int error = ps5_vrange_reserve(size, nullptr, 0x10000, &base);
+-		rpcs3ps5_boot_log("vm:   -> %p (0x%x)", base, error);
+-		return error == 0 ? base : nullptr;
++		for (u64 hint = s_next; hint + size <= 0x100'0000'0000ull;)
++		{
++			void* base = nullptr;
++			const int error = ps5_vrange_reserve(size, reinterpret_cast<void*>(hint), 0x10000, &base);
++			if (error)
++			{
++				hint += 0x1'0000'0000ull;
++				continue;
++			}
++			const u64 got = reinterpret_cast<u64>(base);
++			if (got < 0x20'0000'0000ull)
++			{
++				// Placed back near the system modules: not usable for direct memory
++				ps5_vrange_release(base, size);
++				hint += 0x1'0000'0000ull;
++				continue;
++			}
++			// Later reservations start past this one (a racing thread only costs a retry)
++			u64 next = s_next;
++			while (next < got + size && !s_next.compare_exchange(next, got + size))
++			{
++			}
++			rpcs3ps5_boot_log("vm:   -> %p", base);
++			return base;
++		}
++		rpcs3ps5_boot_log("vm:   -> REFUSED (no room below 1 TiB)");
++		return nullptr;
+ 	}
+ 
+ 	void memory_commit(void* pointer, usz size, protection prot)
+-- 
+2.43.0
+

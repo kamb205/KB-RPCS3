@@ -1,0 +1,910 @@
+From 7966c9c4492fd1b04b4616979580ee38810434dc Mon Sep 17 00:00:00 2001
+From: KB <kb@kb-rpcs3.example>
+Date: Fri, 9 Oct 2026 12:00:00 +0100
+Subject: [PATCH 47/47] PS5: KB-RPCS3 Alpha 0.1.0 - experimental SPU options
+ (off by default), speed/timing logging, build fixes
+
+- SPU LLVM: variable-index insert as a lane select (tuning key spu_insert_select, default 0)
+- SPU LLVM: narrow local-store store for load->insert->store of one element, with an
+  equivalence-check mode (spu_narrow_ls_store / spu_narrow_ls_check, default 0)
+- CPU: keep the busiest SPU thread on the sibling-free CPU (spu_hot_cpu, default -1 = off;
+  only with the RPCS3 thread scheduler)
+- Whole-module LLVM IR verification of SPU code (spu_jit_verify, default 0)
+- Log the effective clocks scale / frame limit at boot and the guest/host time ratio and
+  vblank rate while a game runs (PS5 SPEED / PS5 TIMING)
+- LLVM 22 API: Intrinsic::getOrInsertDeclaration
+- fmt::throw_exception: user-defined [[noreturn]] destructor so clang 18 accepts
+  -Werror=return-type at call sites ending in a throwing switch default
+---
+ Utilities/StrFmt.h                   |   7 +-
+ Utilities/Thread.cpp                 | 158 +++++++++++++-
+ rpcs3/Emu/CPU/CPUTranslator.h        |   7 +
+ rpcs3/Emu/Cell/SPULLVMRecompiler.cpp | 301 +++++++++++++++++++++++++++
+ rpcs3/ps5/ps5_frontend.cpp           |  30 +++
+ 5 files changed, 501 insertions(+), 2 deletions(-)
+
+diff --git a/Utilities/StrFmt.h b/Utilities/StrFmt.h
+index 6d9ea05c9..2cdd3859d 100644
+--- a/Utilities/StrFmt.h
++++ b/Utilities/StrFmt.h
+@@ -394,7 +394,12 @@ namespace fmt
+ 		}
+ 
+ #if !defined(_MSC_VER) || defined(__clang__)
+-		[[noreturn]] ~throw_exception() = default;
++		// PS5 fork: clang 18 (the PS5 toolchain) does not treat the [[noreturn]] constructor above as
++		// terminating control flow for -Wreturn-type, so any non-void function ending in a throwing
++		// switch default (SPUThread.h, MouseHandler.h, ShaderParam.h, swapchain_core.h, ...) failed to
++		// build. A user-defined [[noreturn]] destructor is part of the same full-expression and is
++		// recognised by every supported clang. It is never reached: the constructor exits first.
++		[[noreturn]] ~throw_exception() { __builtin_unreachable(); }
+ #endif
+ 	};
+ 
+diff --git a/Utilities/Thread.cpp b/Utilities/Thread.cpp
+index 2421672fd..6b74ff9ea 100644
+--- a/Utilities/Thread.cpp
++++ b/Utilities/Thread.cpp
+@@ -2847,6 +2847,7 @@ namespace
+ 		pthread_t thread;
+ 		std::shared_ptr<std::atomic<u64>> cpu_ns; // written by the thread's signal handler
+ 		u64 last_ns;
++		u32 last_pct = 0; // share of one core over the last report window
+ 	};
+ 	std::mutex g_ps5_threads_mutex;
+ 	std::vector<ps5_thread_entry> g_ps5_threads;
+@@ -2934,6 +2935,7 @@ std::string ps5_thread_cpu_report(u64 window_ns, usz top)
+ 			const u64 now = e.cpu_ns->load(std::memory_order_relaxed);
+ 			const u64 used = now > e.last_ns ? now - e.last_ns : 0;
+ 			e.last_ns = now;
++			e.last_pct = static_cast<u32>(used * 100 / std::max<u64>(window_ns, 1));
+ 			total += used;
+ 			if (used)
+ 				rows.emplace_back(used, *e.name->load());
+@@ -3958,7 +3960,7 @@ void thread_ctrl::detect_cpu_layout()
+ constexpr u32 kPs5Sibling = 1;
+ 
+ extern "C" int64_t rpcs3ps5_tune(int key); // app/ps5/src/ps5_tuning.c
+-enum { PS5_TUNE_RSX_CPU = 4 };
++enum { PS5_TUNE_RSX_CPU = 4, PS5_TUNE_SPU_HOT_CPU = 7 };
+ 
+ static u64 ps5_affinity_mask(thread_class group, u64 all)
+ {
+@@ -4027,6 +4029,160 @@ u64 ps5_rsx_main_affinity(u64 fallback)
+ 
+ 	return fallback;
+ }
++
++// Combo §3: affinity only — move the busiest SPU thread (>= 85 %) to CPU <cpu>, the one CPU without an SMT
++// sibling, and take that CPU away from every other thread whose normal mask has it. No effect on emulation.
++static thread_class ps5_class_of(const std::string& n)
++{
++	if (n.rfind("SPU", 0) == 0)
++		return thread_class::spu;
++	if (n.rfind("rsx", 0) == 0 || n.rfind("RSX", 0) == 0)
++		return thread_class::rsx;
++	return thread_class::ppu;
++}
++
++namespace
++{
++	bool g_ps5_hot_active = false;
++	pthread_t g_ps5_hot_pinned{};
++	std::string g_ps5_hot_pinned_name;
++	std::string g_ps5_hot_cand_name;
++	int g_ps5_hot_cand_streak = 0;
++	bool g_ps5_hot_conflict_logged = false;
++	// What the last applied pass pinned / how many threads it saw (g_ps5_threads_mutex)
++	pthread_t g_ps5_hot_applied_pinned{};
++	usz g_ps5_hot_applied_count = 0;
++}
++
++static void ps5_apply_mask(pthread_t thread, u64 mask)
++{
++	cpu_set_t cs;
++	CPU_ZERO(&cs);
++	for (u32 c = 0; c < 64u; c++)
++	{
++		const u64 shifted = mask >> c;
++		if (shifted & 1)
++		{
++#pragma GCC diagnostic push
++#pragma GCC diagnostic ignored "-Wold-style-cast"
++			CPU_SET(c, &cs);
++#pragma GCC diagnostic pop
++		}
++		if (shifted <= 1)
++			break;
++	}
++	::pthread_setaffinity_np(thread, sizeof(cpu_set_t), &cs);
++}
++
++extern "C" void ps5_hot_spu_rebalance(s64 cpu)
++{
++	const u64 pmask = thread_ctrl::get_process_affinity_mask();
++
++	if (cpu < 0 || cpu >= 64 || !(pmask >> cpu & 1) || g_cfg.core.thread_scheduler == thread_scheduler_mode::os)
++	{
++		if (g_ps5_hot_active)
++		{
++			std::lock_guard lock(g_ps5_threads_mutex);
++			for (auto& e : g_ps5_threads)
++				ps5_apply_mask(e.thread, ps5_affinity_mask(ps5_class_of(*e.name->load()), pmask));
++			g_ps5_hot_active = false;
++			g_ps5_hot_applied_pinned = {};
++			g_ps5_hot_applied_count = 0;
++			sig_log.notice("PS5 HOTCPU: off, masks restored");
++		}
++		return;
++	}
++
++	// Snapshot and apply under one lock: thread entries are removed under g_ps5_threads_mutex before a thread
++	// exits (thread_base::finalize), so no pthread_t of an exited thread can be used here.
++	std::lock_guard lock(g_ps5_threads_mutex);
++
++	struct row { pthread_t t; std::string name; u32 pct; thread_class cls; };
++	std::vector<row> rows;
++	for (auto& e : g_ps5_threads)
++	{
++		const std::string n = *e.name->load();
++		rows.push_back({e.thread, n, e.last_pct, ps5_class_of(n)});
++	}
++
++	// SPU execution threads only ("SPU[0x...]"); not "SPU Worker" or other helpers.
++	const row* best = nullptr;
++	for (const auto& r : rows)
++		if (r.cls == thread_class::spu && r.name.compare(0, 4, "SPU[") == 0 && (!best || r.pct > best->pct))
++			best = &r;
++
++	if (!g_ps5_hot_active)
++	{
++		if (!best || best->pct < 85)
++			return;
++		g_ps5_hot_active = true;
++		g_ps5_hot_pinned = best->t;
++		g_ps5_hot_pinned_name = best->name;
++		sig_log.notice("PS5 HOTCPU: %s -> CPU %d (%u%%)", best->name, static_cast<int>(cpu), best->pct);
++	}
++	else
++	{
++		bool found = false;
++		u32 pinned_pct = 0;
++		for (const auto& r : rows)
++			if (r.t == g_ps5_hot_pinned) { found = true; pinned_pct = r.pct; }
++		if (!found)
++		{
++			g_ps5_hot_active = false;
++			g_ps5_hot_cand_streak = 0;
++			g_ps5_hot_cand_name.clear();
++			g_ps5_hot_applied_pinned = {};
++			g_ps5_hot_applied_count = 0;
++			return;
++		}
++		if (best && best->name != g_ps5_hot_pinned_name && best->pct >= 85 && best->pct >= pinned_pct + 10)
++		{
++			if (g_ps5_hot_cand_name == best->name)
++				g_ps5_hot_cand_streak++;
++			else
++			{
++				g_ps5_hot_cand_name = best->name;
++				g_ps5_hot_cand_streak = 1;
++			}
++			if (g_ps5_hot_cand_streak >= 2)
++			{
++				g_ps5_hot_pinned = best->t;
++				g_ps5_hot_pinned_name = best->name;
++				g_ps5_hot_cand_streak = 0;
++				g_ps5_hot_cand_name.clear();
++				sig_log.notice("PS5 HOTCPU: %s -> CPU %d (%u%%)", best->name, static_cast<int>(cpu), best->pct);
++			}
++		}
++		else
++		{
++			g_ps5_hot_cand_streak = 0;
++		}
++	}
++
++	if (cpu == rpcs3ps5_tune(PS5_TUNE_RSX_CPU) && !g_ps5_hot_conflict_logged)
++	{
++		g_ps5_hot_conflict_logged = true;
++		sig_log.notice("PS5 HOTCPU: rsx_cpu == spu_hot_cpu; spu_hot_cpu wins for CPU %d", static_cast<int>(cpu));
++	}
++
++	// Re-apply only when the pinned thread or the registered thread count changed; otherwise the masks are
++	// already in force and re-applying every 4 s only fights the OS.
++	if (g_ps5_hot_applied_pinned == g_ps5_hot_pinned && g_ps5_hot_applied_count == rows.size())
++		return;
++
++	for (const auto& r : rows)
++	{
++		const u64 normal = ps5_affinity_mask(r.cls, pmask);
++		if (r.t == g_ps5_hot_pinned)
++			ps5_apply_mask(r.t, 1ull << cpu);
++		else if (normal >> cpu & 1)
++			ps5_apply_mask(r.t, normal & ~(1ull << cpu));
++		else
++			ps5_apply_mask(r.t, normal);
++	}
++	g_ps5_hot_applied_pinned = g_ps5_hot_pinned;
++	g_ps5_hot_applied_count = rows.size();
++}
+ #endif
+ 
+ u64 thread_ctrl::get_affinity_mask(thread_class group)
+diff --git a/rpcs3/Emu/CPU/CPUTranslator.h b/rpcs3/Emu/CPU/CPUTranslator.h
+index 97024207a..fc2189b22 100644
+--- a/rpcs3/Emu/CPU/CPUTranslator.h
++++ b/rpcs3/Emu/CPU/CPUTranslator.h
+@@ -3338,6 +3338,11 @@ public:
+ 		return result;
+ 	}
+ 
++	// Called after a foreign (non-intrinsic) C++ call is emitted. The SPU recompiler uses it to invalidate
++	// its load/insert tracking (the callee may read or write SPU memory or registers); other translators
++	// keep the default no-op.
++	virtual void on_foreign_call() {}
++
+ 	// Call external function: provide name and function pointer
+ 	template <typename RetT = void, typename RT, typename... FArgs, LLVMValue... Args>
+ 	llvm::CallInst* call(std::string_view lame, RT(*_func)(FArgs...), Args... args)
+@@ -3355,6 +3360,7 @@ public:
+ #ifdef _WIN32
+ 		inst->setCallingConv(llvm::CallingConv::Win64);
+ #endif
++		on_foreign_call();
+ 		return inst;
+ 	}
+ 
+@@ -3371,6 +3377,7 @@ public:
+ 	{
+ 		llvm_value_t<RT> r;
+ 		r.value = m_ir->CreateCall(func, {std::forward<Args>(args).eval(m_ir)...});
++		on_foreign_call();
+ 		return r;
+ 	}
+ 
+diff --git a/rpcs3/Emu/Cell/SPULLVMRecompiler.cpp b/rpcs3/Emu/Cell/SPULLVMRecompiler.cpp
+index 4d6173a32..ad762e82f 100644
+--- a/rpcs3/Emu/Cell/SPULLVMRecompiler.cpp
++++ b/rpcs3/Emu/Cell/SPULLVMRecompiler.cpp
+@@ -15,6 +15,9 @@
+ #include "SPUAnalyser.h"
+ #include "SPUInterpreter.h"
+ #include <algorithm>
++#include <map>
++#include <mutex>
++#include <set>
+ #include <thread>
+ 
+ #include "util/v128.hpp"
+@@ -31,6 +34,15 @@ const extern spu_decoder<spu_iflag> g_spu_iflag;
+ 
+ #ifdef __PROSPERO__
+ void ps5_jit_name(u64 addr, std::string name); // Utilities/Thread.cpp
++std::atomic<u64> g_ps5_jit_verify_failures{0};
++extern "C" uint64_t rpcs3ps5_jit_verify_failures() { return g_ps5_jit_verify_failures.load(std::memory_order_relaxed); }
++std::atomic<u64> g_ps5_narrow_ls_check_failures{0};
++extern "C" uint64_t rpcs3ps5_narrow_ls_check_failures() { return g_ps5_narrow_ls_check_failures.load(std::memory_order_relaxed); }
++extern "C" int64_t rpcs3ps5_tune(int key); // app/ps5/src/ps5_tuning.c
++// Cold path called from JITed code when the narrow-store equivalence check (key 9) sees a mismatch.
++extern "C" void rpcs3ps5_narrow_ls_check_fail(u64 hash, u32 pc);
++enum { PS5_TUNE_SPU_INSERT_SELECT = 5, PS5_TUNE_SPU_NARROW_LS_STORE = 6, PS5_TUNE_SPU_HOT_CPU = 7,
++	PS5_TUNE_SPU_JIT_VERIFY = 8, PS5_TUNE_SPU_NARROW_LS_CHECK = 9 };
+ #endif
+ 
+ #ifdef _MSC_VER
+@@ -45,6 +57,7 @@ void ps5_jit_name(u64 addr, std::string name); // Utilities/Thread.cpp
+ #include <llvm/ADT/PostOrderIterator.h>
+ #include <llvm/Analysis/PostDominators.h>
+ #include <llvm/IR/InlineAsm.h>
++#include <llvm/IR/Intrinsics.h>
+ #include <llvm/IR/Verifier.h>
+ #include <llvm/TargetParser/Host.h>
+ #include <llvm/Transforms/Utils/BasicBlockUtils.h>
+@@ -109,6 +122,67 @@ class spu_llvm_recompiler : public spu_recompiler_base, public cpu_translator
+ 
+ 	llvm::Value* m_thread{};
+ 	llvm::Value* m_lsptr{};
++#ifdef __PROSPERO__
++	// combo §4: narrow LS store. A load, a SHUFB that changes one element, and a store of the result: when
++	// the stored value is that insert over that load with the same address, write only the element. The
++	// epoch invalidates the pair on any side-effecting instruction; cleared at every SPU basic block.
++	struct ps5_ld_t { u32 kind; llvm::Value* a; llvm::Value* b; s64 imm; u64 epoch; };
++	struct ps5_ins_t { llvm::Value* base; llvm::Value* idx; llvm::Value* elt; u32 w; u32 n; u64 epoch; };
++	std::map<llvm::Value*, ps5_ld_t> m_ps5_ld;
++	std::map<llvm::Value*, ps5_ins_t> m_ps5_ins;
++	u64 m_ps5_epoch = 1;
++	// Tuning keys 5/6/8/9, read once per compiled function in compile().
++	bool m_ps5_insert_select{};
++	bool m_ps5_narrow_ls_store{};
++	bool m_ps5_jit_verify{};
++	bool m_ps5_narrow_ls_check{};
++	void ps5_track_clear() { m_ps5_epoch++; m_ps5_ld.clear(); m_ps5_ins.clear(); }
++	// Any foreign C++ call may read/write SPU memory or registers, so it invalidates the tracked pair.
++	void on_foreign_call() override { ps5_track_clear(); }
++	void ps5_track_load(llvm::Value* rt, u32 kind, llvm::Value* ra, llvm::Value* rb, s64 imm)
++	{
++		if (m_interp_magn || !rt) return;
++		m_ps5_ld[rt] = { kind, ra, rb, imm, m_ps5_epoch };
++	}
++	void ps5_track_insert(llvm::Value* rt, llvm::Value* base, llvm::Value* idx, llvm::Value* elt, u32 w, u32 n)
++	{
++		if (m_interp_magn || !rt) return;
++		m_ps5_ins[rt] = { base, idx, elt, w, n, m_ps5_epoch };
++	}
++	bool ps5_try_narrow_store(llvm::Value* rt, u32 kind, llvm::Value* ra, llvm::Value* rb, s64 imm, llvm::Value* addr)
++	{
++		if (!m_ps5_narrow_ls_store || m_interp_magn)
++			return false;
++		auto it = m_ps5_ins.find(rt);
++		if (it == m_ps5_ins.end() || it->second.epoch != m_ps5_epoch)
++			return false;
++		const ps5_ins_t ins = it->second;
++		auto lit = m_ps5_ld.find(ins.base);
++		if (lit == m_ps5_ld.end() || lit->second.epoch != m_ps5_epoch)
++			return false;
++		const ps5_ld_t& ld = lit->second;
++		if (ld.kind != kind || ld.a != ra || ld.b != rb || ld.imm != imm)
++			return false;
++		const u32 N = ins.n, w = ins.w;
++		llvm::Type* ety = ins.elt->getType();
++		if (!ety->isIntegerTy() || ety->getIntegerBitWidth() != w * 8)
++			return false;
++		llvm::Value* lane = m_ir->CreateZExt(m_ir->CreateAnd(ins.idx, m_ir->getInt32(N - 1)), get_type<u64>());
++		llvm::Value* off = m_ir->CreateSub(m_ir->getInt64(16 - w), m_ir->CreateMul(lane, m_ir->getInt64(w)));
++		llvm::Value* ptr = _ptr(m_lsptr, m_ir->CreateAdd(addr, off));
++		llvm::Value* val = ins.elt;
++		if (w > 1)
++			val = m_ir->CreateCall(llvm::Intrinsic::getOrInsertDeclaration(m_ir->GetInsertBlock()->getModule(), llvm::Intrinsic::bswap, ety), { val });
++		spu_mem_attr(m_ir->CreateAlignedStore(val, ptr, llvm::Align(w)));
++
++		if (m_ps5_narrow_ls_check)
++		{
++			ps5_narrow_check(rt, addr);
++		}
++		return true;
++	}
++#endif
++
+ 	llvm::Value* m_interp_op{};
+ 	llvm::Value* m_interp_pc{};
+ 	llvm::Value* m_interp_table{};
+@@ -1176,6 +1250,9 @@ class spu_llvm_recompiler : public spu_recompiler_base, public cpu_translator
+ 			spu_context_attr(m_ir->CreateStore(m_ir->getInt8(1), spu_ptr(&spu_thread::unsavable)))->setVolatile(true);
+ 		}
+ 
++#ifdef __PROSPERO__
++		ps5_track_clear(); // foreign call: spu_test_state -> exec_check_state
++#endif
+ 		m_ir->CreateCall(m_test_state, {m_thread});
+ 
+ 		if (may_be_unsafe_for_savestate)
+@@ -1670,6 +1747,16 @@ public:
+ 			return compile_interpreter();
+ 		}
+ 
++#ifdef __PROSPERO__
++		// Tuning keys 5/6/8/9 are read once per compiled function, not per instruction. With all of them
++		// OFF (the r2 defaults) none of this emits anything.
++		m_ps5_insert_select = !m_interp_magn && rpcs3ps5_tune(PS5_TUNE_SPU_INSERT_SELECT) != 0;
++		m_ps5_narrow_ls_store = !m_interp_magn && rpcs3ps5_tune(PS5_TUNE_SPU_NARROW_LS_STORE) != 0;
++		m_ps5_jit_verify = rpcs3ps5_tune(PS5_TUNE_SPU_JIT_VERIFY) != 0;
++		m_ps5_narrow_ls_check = !m_interp_magn && rpcs3ps5_tune(PS5_TUNE_SPU_NARROW_LS_CHECK) != 0;
++		ps5_track_clear();
++#endif
++
+ 		const u32 start0 = _func.entry_point;
+ 		const usz func_size = _func.data.size();
+ 
+@@ -2575,6 +2662,9 @@ public:
+ 				// Initialize basic block info
+ 				const u32 baddr = m_block_queue[bi];
+ 				m_block = &m_blocks[baddr];
++#ifdef __PROSPERO__
++				ps5_track_clear();
++#endif
+ 				m_ir->SetInsertPoint(m_block->block);
+ 				auto& bb = ::at32(m_bbs, baddr);
+ 				bool need_check = false;
+@@ -3256,6 +3346,10 @@ public:
+ 
+ 				m_reduced_loop_info = nullptr;
+ 
++#ifdef __PROSPERO__
++				// The masked-value analysis above emits real instructions; start the real emission fresh.
++				ps5_track_clear();
++#endif
+ 				// Emit instructions
+ 				for (m_pos = baddr; m_pos >= start && m_pos < end && !llvm_has_terminator(m_ir->GetInsertBlock()); m_pos += 4)
+ 				{
+@@ -4001,6 +4095,33 @@ public:
+ #endif
+ 		}
+ 
++#ifdef __PROSPERO__
++		if (m_ps5_jit_verify)
++		{
++			// combo §6.1: verify the whole module (every defined function), not just main_func. Compile-time
++			// only; key 8 is off by default. Log the count and the first failure text.
++			u64 failures = 0;
++			std::string first_err;
++			for (llvm::Function& f : *m_module)
++			{
++				if (f.isDeclaration())
++					continue;
++				std::string err;
++				llvm::raw_string_ostream os(err);
++				if (llvm::verifyFunction(f, &os))
++				{
++					if (!failures)
++						first_err = err;
++					failures++;
++				}
++			}
++			if (failures)
++			{
++				g_ps5_jit_verify_failures.fetch_add(failures, std::memory_order_relaxed);
++				spu_log.error("PS5 JIT verify: %llu failures in %s: %s", static_cast<unsigned long long>(failures), m_hash, first_err);
++			}
++		}
++#endif
+ 		// Register function pointer
+ 		const spu_function_t fn = reinterpret_cast<spu_function_t>(m_jit.get_engine().getPointerToFunction(main_func));
+ #ifdef __PROSPERO__
+@@ -4545,6 +4666,9 @@ public:
+ 
+ 	void STOP(spu_opcode_t op) //
+ 	{
++#ifdef __PROSPERO__
++		ps5_track_clear();
++#endif
+ 		if (m_interp_magn)
+ 		{
+ 			call("spu_syscall", &exec_stop, m_thread, m_ir->CreateAnd(m_interp_op, m_ir->getInt32(0x3fff)));
+@@ -4661,6 +4785,9 @@ public:
+ 
+ 	void RDCH(spu_opcode_t op) //
+ 	{
++#ifdef __PROSPERO__
++		ps5_track_clear();
++#endif
+ 		value_t<u32> res;
+ 
+ 		if (m_interp_magn)
+@@ -4829,6 +4956,9 @@ public:
+ 
+ 	void RCHCNT(spu_opcode_t op) //
+ 	{
++#ifdef __PROSPERO__
++		ps5_track_clear();
++#endif
+ 		value_t<u32> res{};
+ 
+ 		if (m_interp_magn)
+@@ -5061,6 +5191,9 @@ public:
+ 
+ 	void WRCH(spu_opcode_t op) //
+ 	{
++#ifdef __PROSPERO__
++		ps5_track_clear();
++#endif
+ 		const auto val = eval(extract(get_vr(op.rt), 3));
+ 
+ 		if (m_interp_magn)
+@@ -5589,6 +5722,9 @@ public:
+ 
+ 	void SYNC(spu_opcode_t) //
+ 	{
++#ifdef __PROSPERO__
++		ps5_track_clear();
++#endif
+ 		// This instruction must be used following a store instruction that modifies the instruction stream.
+ 		m_ir->CreateFence(llvm::AtomicOrdering::SequentiallyConsistent);
+ 
+@@ -5602,6 +5738,9 @@ public:
+ 
+ 	void DSYNC(spu_opcode_t) //
+ 	{
++#ifdef __PROSPERO__
++		ps5_track_clear();
++#endif
+ 		// This instruction forces all earlier load, store, and channel instructions to complete before proceeding.
+ 		m_ir->CreateFence(llvm::AtomicOrdering::SequentiallyConsistent);
+ 	}
+@@ -7467,6 +7606,28 @@ public:
+ 		set_vr(op.rt4, (get_vr(op.rb) & c) | (get_vr(op.ra) & ~c));
+ 	}
+ 
++#ifdef __PROSPERO__
++	// Lane-select insert (no stack round trip): insertelement with a variable index lowers on x86-64 without
++	// AVX-512 to store-vector / store-element / reload, and the overlapping stores defeat store-to-load
++	// forwarding on Zen 2. Same lane semantics and index.
++	template <typename VT>
++	llvm::Value* ps5_insert_by_select(llvm::Value* vec, llvm::Value* idx, llvm::Value* elt)
++	{
++		constexpr u32 N = std::extent_v<VT>;
++		using ET = std::remove_extent_t<VT>;
++		llvm::Type* ety = get_type<ET>();
++		llvm::Value* idx32 = m_ir->CreateZExtOrTrunc(idx, get_type<u32>());
++		llvm::Value* lane = m_ir->CreateZExtOrTrunc(m_ir->CreateAnd(idx32, m_ir->getInt32(N - 1)), ety);
++		std::vector<llvm::Constant*> k;
++		for (u32 n = 0; n < N; n++)
++		{
++			k.push_back(llvm::ConstantInt::get(ety, n));
++		}
++		const llvm::ElementCount ec = llvm::ElementCount::getFixed(static_cast<unsigned>(N));
++		llvm::Value* mask = m_ir->CreateICmpEQ(m_ir->CreateVectorSplat(ec, lane), llvm::ConstantVector::get(k));
++		return m_ir->CreateSelect(mask, m_ir->CreateVectorSplat(ec, elt), vec);
++	}
++#endif
+ 	void SHUFB(spu_opcode_t op) //
+ 	{
+ 		if (match_vr<u8[16], u16[8], u32[4], u64[2]>(op.rc, [&](auto c, auto MP)
+@@ -7476,8 +7637,26 @@ public:
+ 			// If the mask comes from a constant generation instruction, replace SHUFB with insert
+ 			if (auto [ok, i] = match_expr(c, spu_get_insertion_shuffle_mask<VT>(match<u32>())); ok)
+ 			{
++#ifdef __PROSPERO__
++				{
++					llvm::Value* idx = i.eval(m_ir);
++					llvm::Value* elt = get_scalar(get_vr<VT>(op.ra)).eval(m_ir);
++					// Capture the base register BEFORE op.rt4 is written: for "shufb r5,r7,r5,..." rt4 == rb,
++					// and get_reg_raw(op.rb) after the write would return the result itself.
++					llvm::Value* base = get_reg_raw(op.rb);
++					if (m_ps5_insert_select && !llvm::isa<llvm::Constant>(idx))
++						set_reg_fixed(op.rt4, ps5_insert_by_select<VT>(get_vr<VT>(op.rb).eval(m_ir), idx, elt));
++					else
++						set_vr(op.rt4, insert(get_vr<VT>(op.rb), i, get_scalar(get_vr<VT>(op.ra))));
++					// The map key is the inserted vector itself (used as the full store result by key 9).
++					ps5_track_insert(get_reg_raw(op.rt4), base, idx, elt,
++						static_cast<u32>(sizeof(std::remove_extent_t<VT>)), static_cast<u32>(std::extent_v<VT>));
++					return true;
++				}
++#else
+ 				set_vr(op.rt4, insert(get_vr<VT>(op.rb), i, get_scalar(get_vr<VT>(op.ra))));
+ 				return true;
++#endif
+ 			}
+ 
+ 			return false;
+@@ -9444,6 +9623,11 @@ public:
+ 	{
+ 		const auto bswapped = byteswap(data);
+ 		spu_mem_attr(m_ir->CreateStore(bswapped.eval(m_ir), _ptr(m_lsptr, addr.value)));
++#ifdef __PROSPERO__
++		// Every store path goes through here (including the constant-address STQX/STQD fast paths), so this
++		// is where the tracked load/insert pair is invalidated.
++		ps5_track_clear();
++#endif
+ 	}
+ 
+ 	auto make_load_ls(value_t<u64> addr)
+@@ -9453,6 +9637,27 @@ public:
+ 		return byteswap(data);
+ 	}
+ 
++#ifdef __PROSPERO__
++	// Debug-only equivalence check for the narrow LS store (key 9): reload the whole quad (logical, like
++	// make_load_ls) and compare it with the value the normal 16-byte store would have written. 'rt' is the
++	// inserted vector (the insertion tracking key). Defined after make_load_ls/byteswap so it may use them.
++	void ps5_narrow_check(llvm::Value* rt, llvm::Value* addr)
++	{
++		value_t<u8[16]> raw;
++		raw.value = spu_mem_attr(m_ir->CreateLoad(get_type<u8[16]>(), _ptr(m_lsptr, addr)));
++		llvm::Value* reloaded = byteswap(raw).eval(m_ir);
++		llvm::Value* full = m_ir->CreateBitCast(rt, get_type<u8[16]>());
++		llvm::Value* ok = m_ir->CreateICmpEQ(reloaded, full);
++		auto* bad = llvm::BasicBlock::Create(m_context, "", m_function);
++		auto* cont = llvm::BasicBlock::Create(m_context, "", m_function);
++		m_ir->CreateCondBr(ok, cont, bad, m_md_unlikely);
++		m_ir->SetInsertPoint(bad);
++		call("ps5_narrow_ls_check", &rpcs3ps5_narrow_ls_check_fail, m_ir->getInt64(m_hash_start), m_ir->getInt32(m_pos));
++		m_ir->CreateBr(cont);
++		m_ir->SetInsertPoint(cont);
++	}
++#endif
++
+ 	static constexpr u64 make_negative_LS_offset(u32 original)
+ 	{
+ 		return original | ~u64{SPU_LS_SIZE - 1};
+@@ -9482,7 +9687,17 @@ public:
+ 		}
+ 
+ 		value_t<u64> addr = eval(zext<u64>((extract(a, 3) + extract(b, 3)) & 0x3fff0));
++#ifdef __PROSPERO__
++		if (ps5_try_narrow_store(get_reg_raw(op.rt), 0, get_reg_raw(op.ra), get_reg_raw(op.rb), 0, addr.value))
++		{
++			ps5_track_clear();
++			return;
++		}
++#endif
+ 		make_store_ls(addr, get_vr<u8[16]>(op.rt));
++#ifdef __PROSPERO__
++		ps5_track_clear();
++#endif
+ 	}
+ 
+ 	void LQX(spu_opcode_t op)
+@@ -9509,17 +9724,33 @@ public:
+ 		}
+ 
+ 		value_t<u64> addr = eval(zext<u64>((extract(a, 3) + extract(b, 3)) & 0x3fff0));
++#ifdef __PROSPERO__
++		// Capture the address operands before set_vr(op.rt): a load into its own address register would
++		// otherwise be tracked with the loaded value as its base. Do not track when rt aliases ra/rb.
++		llvm::Value* base_a = get_reg_raw(op.ra);
++		llvm::Value* base_b = get_reg_raw(op.rb);
++#endif
+ 		set_vr(op.rt, make_load_ls(addr));
++#ifdef __PROSPERO__
++		if (op.rt != op.ra && op.rt != op.rb)
++			ps5_track_load(get_reg_raw(op.rt), 0, base_a, base_b, 0);
++#endif
+ 	}
+ 
+ 	void STQA(spu_opcode_t op)
+ 	{
++#ifdef __PROSPERO__
++		ps5_track_clear();
++#endif
+ 		value_t<u64> addr = eval((get_imm<u64>(op.i16, false) << 2) & 0x3fff0);
+ 		make_store_ls(addr, get_vr<u8[16]>(op.rt));
+ 	}
+ 
+ 	void LQA(spu_opcode_t op)
+ 	{
++#ifdef __PROSPERO__
++		ps5_track_clear();
++#endif
+ 		value_t<u64> addr = eval((get_imm<u64>(op.i16, false) << 2) & 0x3fff0);
+ 		set_vr(op.rt, make_load_ls(addr));
+ 	}
+@@ -9531,6 +9762,9 @@ public:
+ 
+ 	void STQR(spu_opcode_t op) //
+ 	{
++#ifdef __PROSPERO__
++		ps5_track_clear();
++#endif
+ 		value_t<u64> addr;
+ 		addr.value = m_interp_magn ? m_ir->CreateZExt(m_interp_pc, get_type<u64>()) : get_pc_as_u64(m_pos);
+ 		addr = eval(((get_imm<u64>(op.i16, false) << 2) + addr) & (m_interp_magn ? 0x3fff0 : ~0xf));
+@@ -9539,6 +9773,9 @@ public:
+ 
+ 	void LQR(spu_opcode_t op) //
+ 	{
++#ifdef __PROSPERO__
++		ps5_track_clear();
++#endif
+ 		value_t<u64> addr;
+ 		addr.value = m_interp_magn ? m_ir->CreateZExt(m_interp_pc, get_type<u64>()) : get_pc_as_u64(m_pos);
+ 		addr = eval(((get_imm<u64>(op.i16, false) << 2) + addr) & (m_interp_magn ? 0x3fff0 : ~0xf));
+@@ -9582,7 +9819,17 @@ public:
+ 		}
+ 
+ 		value_t<u64> addr = eval(zext<u64>(extract(a, 3) & 0x3fff0) + (get_imm<u64>(op.si10) << 4));
++#ifdef __PROSPERO__
++		if (ps5_try_narrow_store(get_reg_raw(op.rt), 1, get_reg_raw(op.ra), nullptr, op.si10, addr.value))
++		{
++			ps5_track_clear();
++			return;
++		}
++#endif
+ 		make_store_ls(addr, get_vr<u8[16]>(op.rt));
++#ifdef __PROSPERO__
++		ps5_track_clear();
++#endif
+ 	}
+ 
+ 	void LQD(spu_opcode_t op)
+@@ -9609,7 +9856,14 @@ public:
+ 		}
+ 
+ 		value_t<u64> addr = eval(zext<u64>(extract(a, 3) & 0x3fff0) + (get_imm<u64>(op.si10) << 4));
++#ifdef __PROSPERO__
++		llvm::Value* base_a = get_reg_raw(op.ra);
++#endif
+ 		set_vr(op.rt, make_load_ls(addr));
++#ifdef __PROSPERO__
++		if (op.rt != op.ra)
++			ps5_track_load(get_reg_raw(op.rt), 1, base_a, nullptr, op.si10);
++#endif
+ 	}
+ 
+ 	void make_halt(value_t<bool> cond)
+@@ -9908,6 +10162,9 @@ public:
+ 
+ 	void BINZ(spu_opcode_t op) //
+ 	{
++#ifdef __PROSPERO__
++		ps5_track_clear();
++#endif
+ 		if (m_block) m_block->block_end = m_ir->GetInsertBlock();
+ 
+ 		const auto rt = get_vr<u8[16]>(op.rt);
+@@ -9971,6 +10228,9 @@ public:
+ 
+ 	void BIHZ(spu_opcode_t op) //
+ 	{
++#ifdef __PROSPERO__
++		ps5_track_clear();
++#endif
+ 		if (m_block) m_block->block_end = m_ir->GetInsertBlock();
+ 
+ #ifdef ARCH_X64
+@@ -10037,6 +10297,9 @@ public:
+ 
+ 	void BI(spu_opcode_t op) //
+ 	{
++#ifdef __PROSPERO__
++		ps5_track_clear();
++#endif
+ 		if (m_block) m_block->block_end = m_ir->GetInsertBlock();
+ 		const auto addr = eval(extract(get_vr(op.ra), 3) & 0x3fffc);
+ 
+@@ -10118,6 +10381,9 @@ public:
+ 			{
+ 				// Can't afford external tail call in true functions
+ 				m_ir->CreateStore(m_ir->getInt32("BIJT"_u32), _ptr(m_memptr, 0xffdead20));
++#ifdef __PROSPERO__
++				ps5_track_clear(); // foreign call: spu_test_state -> exec_check_state
++#endif
+ 				m_ir->CreateCall(m_test_state, {m_thread});
+ 				m_ir->CreateBr(sw->getDefaultDest());
+ 			}
+@@ -10135,6 +10401,9 @@ public:
+ 
+ 	void BISL(spu_opcode_t op) //
+ 	{
++#ifdef __PROSPERO__
++		ps5_track_clear();
++#endif
+ 		if (m_block) m_block->block_end = m_ir->GetInsertBlock();
+ 		const auto addr = eval(extract(get_vr(op.ra), 3) & 0x3fffc);
+ 		set_link(op);
+@@ -10162,6 +10431,9 @@ public:
+ 
+ 	void BRZ(spu_opcode_t op) //
+ 	{
++#ifdef __PROSPERO__
++		ps5_track_clear();
++#endif
+ 		if (m_interp_magn)
+ 		{
+ 			value_t<u32> target;
+@@ -10240,6 +10512,9 @@ public:
+ 
+ 	void BRNZ(spu_opcode_t op) //
+ 	{
++#ifdef __PROSPERO__
++		ps5_track_clear();
++#endif
+ 		if (m_interp_magn)
+ 		{
+ 			value_t<u32> target;
+@@ -10409,6 +10684,9 @@ public:
+ 
+ 	void BRA(spu_opcode_t op) //
+ 	{
++#ifdef __PROSPERO__
++		ps5_track_clear();
++#endif
+ 		if (m_interp_magn)
+ 		{
+ 			m_interp_pc = eval((get_imm<u32>(op.i16, false) << 2) & 0x3fffc).value;
+@@ -10427,12 +10705,18 @@ public:
+ 
+ 	void BRASL(spu_opcode_t op) //
+ 	{
++#ifdef __PROSPERO__
++		ps5_track_clear();
++#endif
+ 		set_link(op);
+ 		BRA(op);
+ 	}
+ 
+ 	void BR(spu_opcode_t op) //
+ 	{
++#ifdef __PROSPERO__
++		ps5_track_clear();
++#endif
+ 		if (m_interp_magn)
+ 		{
+ 			value_t<u32> target;
+@@ -10453,6 +10737,9 @@ public:
+ 
+ 	void BRSL(spu_opcode_t op) //
+ 	{
++#ifdef __PROSPERO__
++		ps5_track_clear();
++#endif
+ 		set_link(op);
+ 
+ 		const u32 target = spu_branch_target(m_pos, op.i16);
+@@ -10528,6 +10815,20 @@ decltype(&spu_llvm_recompiler::UNK) spu_llvm_recompiler::decode(u32 op)
+ 	return s_spu_llvm_decoder.decode(op);
+ }
+ 
++#ifdef __PROSPERO__
++// Cold path from JITed code: count a narrow-store equivalence (key 9) mismatch and log it once per
++// function hash + SPU pc.
++extern "C" void rpcs3ps5_narrow_ls_check_fail(u64 hash, u32 pc)
++{
++	g_ps5_narrow_ls_check_failures.fetch_add(1, std::memory_order_relaxed);
++	static std::mutex mtx;
++	static std::set<std::pair<u64, u32>> seen;
++	std::lock_guard lock(mtx);
++	if (seen.insert(std::make_pair(hash, pc)).second)
++		spu_log.error("PS5 NARROW CHECK: narrow store mismatch hash=0x%llx pc=0x%x", static_cast<unsigned long long>(hash), pc);
++}
++#endif
++
+ #else
+ 
+ std::unique_ptr<spu_recompiler_base> spu_recompiler_base::make_llvm_recompiler(u8 magn)
+diff --git a/rpcs3/ps5/ps5_frontend.cpp b/rpcs3/ps5/ps5_frontend.cpp
+index 71b7bcb17..4b4189c73 100644
+--- a/rpcs3/ps5/ps5_frontend.cpp
++++ b/rpcs3/ps5/ps5_frontend.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include "Emu/System.h"
+ #include "Emu/system_config.h"
++#include "Emu/Cell/timers.hpp"
+ #include "Emu/system_utils.hpp"
+ #include "Emu/emu_callbacks.h"
+ #include "Emu/vfs_config.h"
+@@ -382,6 +383,9 @@ int64_t rpcs3ps5_tune(int key);
+ void rpcs3ps5_tune_refresh(void);
+ const char* rpcs3ps5_tune_describe(void);
+ void ps5_vk_event_stats(uint64_t* waits, uint64_t* spin_tsc, uint64_t* sleeps);
++void ps5_hot_spu_rebalance(int64_t cpu); // Utilities/Thread.cpp (combo §3)
++uint64_t rpcs3ps5_jit_verify_failures(void); // SPULLVMRecompiler.cpp (combo §6.1)
++uint64_t rpcs3ps5_narrow_ls_check_failures(void); // SPULLVMRecompiler.cpp (combo narrow-store check)
+ extern uint64_t radv_ps5_stat_waits __attribute__((weak));
+ extern uint64_t radv_ps5_stat_spin_ns __attribute__((weak));
+ extern uint64_t radv_ps5_stat_sleeps __attribute__((weak));
+@@ -938,7 +942,26 @@ void start_watchdog()
+ 					sys_log.notice("PS5 FPS: %.1f | %s", (flips - last_flips) * 1000.0 / window_ms, ps5_frame_stats());
+ 					last_flips = flips;
+ 				}
++				{
++					// guest/host should read the Clocks scale (1.00 normal play, 3.00 in the benchmark);
++					// vblank should read the RSX vblank rate (~60/s) if the vblank thread is running.
++					// The first window has no previous sample, so it reports 0.000.
++					static u64 last_guest = 0;
++					static u64 last_vblank = 0;
++					const u64 guest = get_guest_system_time();
++					const double guest_ratio = last_guest ? static_cast<double>(guest - last_guest) / (window_ms * 1000.0) : 0.0;
++					last_guest = guest;
++					u64 vblank = 0;
++					if (rsx::thread* rsx = rsx::get_current_renderer())
++						vblank = rsx->vblank_count.load();
++					const double vblank_hz = last_vblank ? (vblank - last_vblank) * 1000.0 / window_ms : 0.0;
++					last_vblank = vblank;
++					sys_log.notice("PS5 TIMING: guest/host %.3f, vblank %.1f/s", guest_ratio, vblank_hz);
++				}
+ 				sys_log.notice("PS5 CPU: %s", ps5_thread_cpu_report(window_ms * 1'000'000, 14));
++				ps5_hot_spu_rebalance(rpcs3ps5_tune(7)); // PS5_TUNE_SPU_HOT_CPU
++				sys_log.notice("PS5 JIT verify: %llu failures", static_cast<unsigned long long>(rpcs3ps5_jit_verify_failures()));
++				sys_log.notice("PS5 NARROW CHECK: %llu mismatches", static_cast<unsigned long long>(rpcs3ps5_narrow_ls_check_failures()));
+ 				sys_log.notice("PS5 core clock: %u MHz", ps5_core_mhz());
+ 				{
+ 					const u64 calls = utils::g_ps5_mprotect_calls.exchange(0);
+@@ -1035,6 +1058,13 @@ extern "C" int rpcs3ps5_run(const char* path)
+ 		return fail(fmt::format("boot failed: %s", result));
+ 	}
+ 
++	// The speed the running title actually got (global config with its own on top). Clocks scale
++	// scales emulated system time; a per-game config left at the benchmark's 300% makes the game run
++	// ~3x speed, so log it after BootGame applied the custom config.
++	sys_log.notice("PS5 SPEED: clocks scale %d%%, frame limit %s, vblank %d Hz (from g_cfg)",
++		g_cfg.core.clocks_scale.get(), fmt::format("{}", g_cfg.video.frame_limit.get()).c_str(),
++		g_cfg.video.vblank_rate.get());
++
+ 	// Stand in for Qt's event loop until the game ends
+ 	u64 touch_held_ms = 0;
+ 	bool stop_requested = false;
+-- 
+2.43.0
+
