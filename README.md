@@ -11,7 +11,7 @@
   <img alt="Status: source release" src="https://img.shields.io/badge/status-source%20release-1f6feb?style=flat-square">
   <img alt="Platform: PS5 homebrew" src="https://img.shields.io/badge/platform-PS5%20homebrew-0aa2c0?style=flat-square">
   <img alt="Licence: GPL-2.0-only + GPL-3.0-or-later" src="https://img.shields.io/badge/licence-GPL--2.0--only%20%2B%20GPL--3.0--or--later-6e7681?style=flat-square">
-  <img alt="Latest release" src="https://img.shields.io/github/v/release/kamb205/KB-RPCS3?style=flat-square&label=release&color=0aa2c0">
+  <img alt="Latest release" src="https://img.shields.io/github/v/release/kamb205/KB-RPCS3?include_prereleases&style=flat-square&label=release&color=0aa2c0">
 </p>
 
 KB-RPCS3 runs [RPCS3](https://rpcs3.net), the open-source PlayStation 3 emulator, as a
