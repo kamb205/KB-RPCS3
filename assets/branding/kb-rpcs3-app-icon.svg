@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" role="img" aria-label="KB-RPCS3 app icon">
+  <!-- KB-RPCS3 original app icon: dark gradient tile, cyan border, stylised 3, wordmark. -->
+  <defs>
+    <linearGradient id="tileBg" x1="0" y1="0" x2="0.35" y2="1">
+      <stop offset="0" stop-color="#0E1620"/>
+      <stop offset="1" stop-color="#18284C"/>
+    </linearGradient>
+    <linearGradient id="tileMark" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#5BEDF7"/>
+      <stop offset="1" stop-color="#00A8CF"/>
+    </linearGradient>
+  </defs>
+  <rect width="1024" height="1024" fill="url(#tileBg)"/>
+  <rect x="56.32" y="56.32" width="911.36" height="911.36" rx="174.08"
+        fill="none" stroke="#00BED6" stroke-width="18.43"/>
+  <g fill="none" stroke="url(#tileMark)" stroke-width="56.32" transform="translate(0 -122.88)">
+    <path d="M469.76 266.24 A153.6 122.88 0 0 1 469.76 512"/>
+    <path d="M469.76 512 A153.6 122.88 0 0 1 469.76 757.76"/>
+    <path d="M400.64 512 H623.36"/>
+  </g>
+  <text x="512" y="820" text-anchor="middle" font-family="Arial, Helvetica, sans-serif"
+        font-weight="bold" font-size="112" letter-spacing="1" fill="#E8F6FF">KB-RPCS3</text>
+  <text x="512" y="906" text-anchor="middle" font-family="Arial, Helvetica, sans-serif"
+        font-size="52" letter-spacing="6" fill="#96CDDC">ALPHA 0.1.0</text>
+</svg>

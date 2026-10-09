@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" role="img" aria-label="KB-RPCS3 mark">
+  <!-- KB-RPCS3 original stylised numeral 3. Drawn from primitives; not derived from any
+       Sony or PlayStation logo, nor from the upstream RPCS3 artwork. -->
+  <defs>
+    <linearGradient id="markGrave" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#5BEDF7"/>
+      <stop offset="1" stop-color="#00A8CF"/>
+    </linearGradient>
+  </defs>
+  <g fill="none" stroke="url(#markGrave)" stroke-width="56.32">
+    <path d="M469.76 266.24 A153.6 122.88 0 0 1 469.76 512"/>
+    <path d="M469.76 512 A153.6 122.88 0 0 1 469.76 757.76"/>
+    <path d="M400.64 512 H623.36"/>
+  </g>
+</svg>
