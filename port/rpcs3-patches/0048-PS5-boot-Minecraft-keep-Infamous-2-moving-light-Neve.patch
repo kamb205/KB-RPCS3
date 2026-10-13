@@ -1,0 +1,4895 @@
+From f683776bb7700ead8c73c45b089e556568508ae3 Mon Sep 17 00:00:00 2001
+From: MegaCadeDev <garylikovic@gmail.com>
+Date: Tue, 13 Oct 2026 14:30:00 -0400
+Subject: [PATCH] PS5: boot Minecraft, keep Infamous 2 moving, light NeverDead
+
+Minecraft's disc extra deadlocked the title thread, and its theme package was rejected for paths that still stay inside dev_hdd0. A started PPU missed its wakeup, and the random-number syscall opened /dev/urandom.
+
+Infamous 2 keeps the movie on Mega ASMJIT blocks and compiles SPURS as Safe. usleep waits on a private word so SPU stores do not cancel it. MWAITX does not honor its timer here, so reservation waits use clock_nanosleep. Relaxed ZCULL avoids a GPU flush every frame.
+
+NeverDead's lighting reads the color buffer back, so Write Color Buffers is turned on for BLUS30654 and BLES01303 only.
+
+Co-authored-by: Cursor <cursoragent@cursor.com>
+---
+ Utilities/Config.h                     |   13 +-
+ Utilities/Thread.cpp                   |  117 +-
+ Utilities/Thread.h                     |    4 +
+ rpcs3/Crypto/unpkg.cpp                 |   53 +-
+ rpcs3/Emu/Cell/SPUASMJITRecompiler.cpp | 1616 ++++++++++++++++++------
+ rpcs3/Emu/Cell/SPUASMJITRecompiler.h   |   38 +-
+ rpcs3/Emu/Cell/SPUCommonRecompiler.cpp |  540 +++++++-
+ rpcs3/Emu/Cell/SPULLVMRecompiler.cpp   |   27 +-
+ rpcs3/Emu/Cell/SPURecompiler.h         |   29 +
+ rpcs3/Emu/Cell/SPUThread.cpp           |  118 +-
+ rpcs3/Emu/Cell/SPUThread.h             |    2 +
+ rpcs3/Emu/Cell/lv2/lv2.cpp             |   28 +
+ rpcs3/Emu/Cell/lv2/sys_ppu_thread.cpp  |    4 +
+ rpcs3/Emu/Cell/lv2/sys_ss.cpp          |    7 +
+ rpcs3/Emu/System.cpp                   |   17 +
+ rpcs3/Emu/system_config_types.h        |    5 +
+ rpcs3/ps5/ps5_frontend.cpp             |   75 +-
+ 17 files changed, 2249 insertions(+), 444 deletions(-)
+
+diff --git a/Utilities/Config.h b/Utilities/Config.h
+index e56df11d5..a02de4eef 100644
+--- a/Utilities/Config.h
++++ b/Utilities/Config.h
+@@ -5,6 +5,9 @@
+ #include "util/logs.hpp"
+ #include "util/atomic.hpp"
+ #include "util/shared_ptr.hpp"
++#include "Emu/system_config_types.h"
++
++#include <type_traits>
+ 
+ #include <algorithm>
+ #include <utility>
+@@ -240,12 +243,20 @@ namespace cfg
+ 
+ 		operator T() const
+ 		{
++			if constexpr (std::is_same_v<T, spu_block_size_type>)
++			{
++				if (g_tls_spu_block_size_override)
++				{
++					return *g_tls_spu_block_size_override;
++				}
++			}
++
+ 			return m_value;
+ 		}
+ 
+ 		T get() const
+ 		{
+-			return m_value;
++			return static_cast<T>(*this);
+ 		}
+ 
+ 		T get_default() const
+diff --git a/Utilities/Thread.cpp b/Utilities/Thread.cpp
+index 6b74ff9ea..dcc49afa0 100644
+--- a/Utilities/Thread.cpp
++++ b/Utilities/Thread.cpp
+@@ -10,6 +10,16 @@
+ #include "Thread.h"
+ #include "Utilities/JIT.h"
+ #include <cfenv>
++#include <setjmp.h>
++
++// Set only around an SPU LLVM compile. A host fault longjmps back so that one
++// module cannot kill the worker and freeze the cache progress dialog.
++static thread_local sigjmp_buf* g_host_fault_jmp = nullptr;
++
++void thread_ctrl::set_host_fault_jmp(void* sigjmp_buf_ptr)
++{
++	g_host_fault_jmp = static_cast<sigjmp_buf*>(sigjmp_buf_ptr);
++}
+ 
+ #ifdef ARCH_ARM64
+ #include "Emu/CPU/Backends/AArch64/AArch64Signal.h"
+@@ -2628,6 +2638,13 @@ static void signal_handler(int /*sig*/, siginfo_t* info, void* uct) noexcept
+ 		}
+ 	}
+ 
++	if (g_host_fault_jmp)
++	{
++		sigjmp_buf* jump = g_host_fault_jmp;
++		g_host_fault_jmp = nullptr;
++		siglongjmp(*jump, 1);
++	}
++
+ 	std::string msg = fmt::format("Segfault %s location %p at %p.\n", cause, info->si_addr, RIP(context));
+ 
+ 	if (vm::try_get_addr(info->si_addr).second)
+@@ -2692,7 +2709,6 @@ static void signal_handler(int /*sig*/, siginfo_t* info, void* uct) noexcept
+ 
+ 	sys_log.fatal("\n%s", msg);
+ 	sys_log.notice("\n%s", dump_useful_thread_info());
+-	logs::listener::sync_all();
+ 
+ 	if (IsDebuggerPresent())
+ 	{
+@@ -2840,6 +2856,16 @@ void thread_base::start()
+ // thread SIGUSR1 and the thread stores its own CLOCK_THREAD_CPUTIME_ID in its slot.
+ namespace
+ {
++	struct ps5_guest_snap
++	{
++		std::atomic<u32> pc{0};
++		std::atomic<u32> op{0};
++		std::atomic<u32> flags{0}; // 1 = SPU running, 2 = SPU waiting, 4 = PPU
++		std::atomic<const char*> fn{nullptr};
++		std::atomic<u32> aux{0}; // SPU reservation address, or PPU cpu_flag bits
++		std::atomic<u32> aux2{0}; // SPU event mask
++	};
++
+ 	struct ps5_thread_entry
+ 	{
+ 		thread_base* base;
+@@ -2848,10 +2874,12 @@ namespace
+ 		std::shared_ptr<std::atomic<u64>> cpu_ns; // written by the thread's signal handler
+ 		u64 last_ns;
+ 		u32 last_pct = 0; // share of one core over the last report window
++		std::shared_ptr<ps5_guest_snap> guest;
+ 	};
+ 	std::mutex g_ps5_threads_mutex;
+ 	std::vector<ps5_thread_entry> g_ps5_threads;
+ 	thread_local std::atomic<u64>* t_ps5_cpu_slot = nullptr;
++	thread_local ps5_guest_snap* t_ps5_guest = nullptr;
+ 
+ 	u64 ps5_own_cpu_ns()
+ 	{
+@@ -2873,6 +2901,29 @@ namespace
+ 		if (!slot)
+ 			return;
+ 		slot->store(ps5_own_cpu_ns(), std::memory_order_relaxed);
++		if (auto* guest = t_ps5_guest)
++		{
++			if (auto* spu = cpu_thread::get_current<spu_thread>())
++			{
++				const u32 pc = spu->pc & 0x3fffc;
++				u32 op = 0;
++				if (spu->ls && pc < static_cast<u32>(SPU_LS_SIZE))
++					op = static_cast<u32>(*reinterpret_cast<const be_t<u32>*>(spu->ls + pc));
++				guest->pc.store(pc, std::memory_order_relaxed);
++				guest->op.store(op, std::memory_order_relaxed);
++				guest->flags.store((+spu->state & cpu_flag::wait) ? 2u : 1u, std::memory_order_relaxed);
++				guest->aux.store(spu->raddr, std::memory_order_relaxed);
++				guest->aux2.store(static_cast<u32>(spu->ch_events.load().mask), std::memory_order_relaxed);
++			}
++			else if (auto* ppu = cpu_thread::get_current<ppu_thread>())
++			{
++				guest->pc.store(ppu->cia, std::memory_order_relaxed);
++				guest->op.store(0, std::memory_order_relaxed);
++				guest->flags.store(4u, std::memory_order_relaxed);
++				guest->fn.store(ppu->last_function, std::memory_order_relaxed);
++				guest->aux.store(static_cast<u32>(+ppu->state), std::memory_order_relaxed);
++			}
++		}
+ 		if (slot == g_ps5_sample_target.load(std::memory_order_relaxed) && uct)
+ 		{
+ 			const usz i = g_ps5_sample_count.fetch_add(1, std::memory_order_relaxed);
+@@ -2911,9 +2962,11 @@ namespace
+ 		if (!installed)
+ 			return;
+ 		auto slot = std::make_shared<std::atomic<u64>>(ps5_own_cpu_ns());
++		auto guest = std::make_shared<ps5_guest_snap>();
+ 		t_ps5_cpu_slot = slot.get();
++		t_ps5_guest = guest.get();
+ 		std::lock_guard lock(g_ps5_threads_mutex);
+-		g_ps5_threads.push_back({base, name, ::pthread_self(), slot, slot->load()});
++		g_ps5_threads.push_back({base, name, ::pthread_self(), slot, slot->load(), 0, guest});
+ 	}
+ }
+ 
+@@ -2961,6 +3014,36 @@ std::string ps5_thread_top_name(usz i)
+ 	return i < g_ps5_top_names.size() ? g_ps5_top_names[i] : std::string();
+ }
+ 
++// Guest location of a hot SPU and of the PPU main thread. Call after ps5_thread_cpu_report(),
++// which has already signalled each thread to snapshot its own PC.
++std::string ps5_busy_guest_pcs()
++{
++	std::lock_guard lock(g_ps5_threads_mutex);
++	std::string out;
++	for (const auto& e : g_ps5_threads)
++	{
++		if (!e.guest)
++			continue;
++		const std::string& name = *e.name->load();
++		const u32 flags = e.guest->flags.load(std::memory_order_relaxed);
++		const bool hot_spu = (flags == 1 || flags == 2) && e.last_pct >= 40;
++		const bool any_ppu = flags == 4;
++		if (hot_spu)
++			fmt::append(out, "%s %u%% pc=0x%05x op=0x%08x %s raddr=0x%x mask=0x%x | ", name, e.last_pct,
++				e.guest->pc.load(std::memory_order_relaxed), e.guest->op.load(std::memory_order_relaxed),
++				flags == 2 ? "wait" : "run", e.guest->aux.load(std::memory_order_relaxed), e.guest->aux2.load(std::memory_order_relaxed));
++		else if (any_ppu)
++		{
++			const char* fn = e.guest->fn.load(std::memory_order_relaxed);
++			fmt::append(out, "%s %u%% cia=0x%08x %s state=0x%x | ", name, e.last_pct,
++				e.guest->pc.load(std::memory_order_relaxed), fn ? fn : "-", e.guest->aux.load(std::memory_order_relaxed));
++		}
++	}
++	if (out.empty())
++		out = "(none)";
++	return out;
++}
++
+ // Samples where the thread named `name` executes, `count` times 5 ms apart; "addr:hits ..." (most hit first),
+ // addresses as in the title image (symbolise addr-0x400000 against llvm-pie.elf)
+ // SPU JIT code by name (2026-10-08): SPULLVMRecompiler.cpp registers each compiled SPU function's start address
+@@ -3811,7 +3894,35 @@ void thread_ctrl::set_name(std::string name)
+ 
+ 	sig_log.fatal("Thread terminated due to fatal error: %s", reason);
+ 
+-	logs::listener::sync_all();
++	if (const auto _this = g_tls_this_thread)
++	{
++		// Default-construct the thread result, then publish errored before any lock.
++		// finalize() takes the PS5 thread-list mutex, which a longjmp out of LLVM can
++		// still hold, and the cache build joins on this state.
++		if (g_tls_error_callback)
++		{
++			g_tls_error_callback();
++		}
++
++		_this->m_sync.fetch_op([](u32& v)
++		{
++			v &= -4;
++			v |= static_cast<u32>(thread_state::errored);
++		});
++		_this->m_sync.notify_all();
++
++#ifdef __PROSPERO__
++		if (g_ps5_threads_mutex.try_lock())
++		{
++			std::erase_if(g_ps5_threads, [_this](const ps5_thread_entry& e) { return e.base == _this; });
++			t_ps5_cpu_slot = nullptr;
++			g_ps5_threads_mutex.unlock();
++		}
++#endif
++
++		thread_base::finalize(umax);
++		pthread_exit(nullptr);
++	}
+ 
+ 	if (IsDebuggerPresent())
+ 	{
+diff --git a/Utilities/Thread.h b/Utilities/Thread.h
+index cc6c82658..00d2dc266 100644
+--- a/Utilities/Thread.h
++++ b/Utilities/Thread.h
+@@ -315,6 +315,10 @@ public:
+ 	// Exit.
+ 	[[noreturn]] static void emergency_exit(std::string_view reason);
+ 
++	// While set, a host segfault longjmps here instead of killing the thread.
++	// The pointer is a sigjmp_buf*. Used so one bad SPU LLVM module cannot wedge the cache build.
++	static void set_host_fault_jmp(void* sigjmp_buf_ptr);
++
+ 	// Exit the current named thread as errored without reporting a fatal error.
+ 	[[noreturn]] static void silent_exit() noexcept;
+ 
+diff --git a/rpcs3/Crypto/unpkg.cpp b/rpcs3/Crypto/unpkg.cpp
+index 45b903335..d87ce08b9 100644
+--- a/rpcs3/Crypto/unpkg.cpp
++++ b/rpcs3/Crypto/unpkg.cpp
+@@ -756,8 +756,23 @@ package_install_result package_reader::check_target_app_version() const
+ 		return {package_install_result::error_type::no_error};
+ 	}
+ 
+-	const std::string sfo_path = rpcs3::utils::get_hdd0_dir() + "game/" + std::string(title_id) + "/PARAM.SFO";
+-	const fs::file installed_sfo_file(sfo_path);
++	std::string sfo_path = rpcs3::utils::get_hdd0_dir() + "game/" + std::string(title_id) + "/PARAM.SFO";
++	fs::file installed_sfo_file(sfo_path);
++	if (!installed_sfo_file)
++	{
++		// First boot from a disc folder: the game is not in dev_hdd0/game yet.
++		// The mounted disc PARAM.SFO is the version this extra was built against.
++		const std::string disc_sfo_path = vfs::get("/dev_bdvd/PS3_GAME/PARAM.SFO");
++		fs::file disc_sfo_file(disc_sfo_path);
++
++		if (disc_sfo_file)
++		{
++			pkg_log.notice("No installed PARAM.SFO for %s; comparing target app version against the disc (%s)", title_id, disc_sfo_path);
++			sfo_path = disc_sfo_path;
++			installed_sfo_file = std::move(disc_sfo_file);
++		}
++	}
++
+ 	if (!installed_sfo_file)
+ 	{
+ 		if (!target_app_ver.empty())
+@@ -966,9 +981,23 @@ bool package_reader::fill_data(std::map<std::string, install_entry*>& all_instal
+ 		return false;
+ 	}
+ 
+-	const auto is_inside_install_path = [&install_path](const std::filesystem::path& path)
++	// Disc extras (a theme-typed package whose entries are '../../dev_hdd0/...') name files
++	// relative to a directory above the content-type folder. Those still have to stay inside
++	// dev_hdd0. Jailing to the content folder rejects the whole package and aborts the boot.
++	std::string hdd0_dir = rpcs3::utils::get_hdd0_dir();
++	while (hdd0_dir.ends_with('/'))
++		hdd0_dir.pop_back();
++	const std::filesystem::path hdd0_path = canonicalize(hdd0_dir);
++
++	if (hdd0_path.empty())
+ 	{
+-		return std::mismatch(install_path.begin(), install_path.end(), path.begin(), path.end()).first == install_path.end();
++		pkg_log.error("Failed to normalize dev_hdd0 path '%s'", hdd0_dir);
++		return false;
++	}
++
++	const auto is_inside = [](const std::filesystem::path& root, const std::filesystem::path& path)
++	{
++		return std::mismatch(root.begin(), root.end(), path.begin(), path.end()).first == root.end();
+ 	};
+ 
+ 	m_install_entries.clear();
+@@ -1008,7 +1037,7 @@ bool package_reader::fill_data(std::map<std::string, install_entry*>& all_instal
+ 
+ 		std::string_view name = fmt::trim_back_sv(name_buf, "\0"sv);
+ 
+-		if (leaves_directory(name))
++		if (name.starts_with('/'))
+ 		{
+ 			num_failures++;
+ 			pkg_log.error("PKG entry path escapes installation directory: '%s'", name);
+@@ -1046,10 +1075,10 @@ bool package_reader::fill_data(std::map<std::string, install_entry*>& all_instal
+ 			canonical_path = found->second / fs_path_from_utf8(std::string_view(path).substr(slash + 1));
+ 		}
+ 
+-		if (canonical_path.empty() || !is_inside_install_path(canonical_path))
++		if (canonical_path.empty() || !is_inside(hdd0_path, canonical_path))
+ 		{
+ 			num_failures++;
+-			pkg_log.error("PKG entry path escapes installation directory: '%s'", name);
++			pkg_log.error("PKG entry path escapes dev_hdd0: '%s'", name);
+ 			break;
+ 		}
+ 
+@@ -1472,6 +1501,16 @@ package_install_result package_reader::extract_data(std::deque<package_reader>&
+ 		// Check if this package is allowed to be installed on top of the existing data
+ 		const package_install_result version_check = reader.check_target_app_version();
+ 
++		if (version_check.error == package_install_result::error_type::app_version)
++		{
++			// The disc can ship an extra built for a newer app version than PS3_GAME.
++			// That package does not apply yet; the disc game itself is still bootable.
++			pkg_log.warning("Skipping package '%s': app version does not match (installed '%s', package '%s', target '%s')",
++				reader.m_path, version_check.version.installed, version_check.version.app_ver, version_check.version.expected);
++			reader.m_result = result::error;
++			continue;
++		}
++
+ 		if (version_check.error != package_install_result::error_type::no_error)
+ 		{
+ 			reader.m_result = result::error; // We don't know if it's dirty yet.
+diff --git a/rpcs3/Emu/Cell/SPUASMJITRecompiler.cpp b/rpcs3/Emu/Cell/SPUASMJITRecompiler.cpp
+index eb9a92341..44856fd1a 100644
+--- a/rpcs3/Emu/Cell/SPUASMJITRecompiler.cpp
++++ b/rpcs3/Emu/Cell/SPUASMJITRecompiler.cpp
+@@ -23,6 +23,8 @@
+ #define SPU_OFF_8(x, ...) asmjit::x86::byte_ptr(*cpu, offset32(&spu_thread::x, ##__VA_ARGS__))
+ 
+ const spu_decoder<spu_recompiler> s_spu_decoder;
++extern const spu_decoder<spu_itype> g_spu_itype;
++extern const spu_decoder<spu_iflag> g_spu_iflag;
+ 
+ std::unique_ptr<spu_recompiler_base> spu_recompiler_base::make_asmjit_recompiler()
+ {
+@@ -31,6 +33,7 @@ std::unique_ptr<spu_recompiler_base> spu_recompiler_base::make_asmjit_recompiler
+ 
+ spu_recompiler::spu_recompiler()
+ {
++	ps5_drop_gpr_cache();
+ }
+ 
+ void spu_recompiler::init()
+@@ -156,8 +159,14 @@ spu_function_t spu_recompiler::compile(spu_program&& _func)
+ 	for (u32 i = 0; i < vec_vars.size(); i++)
+ 	{
+ 		vec[i] = vec_vars[i];
++		m_xmm_reg[i] = vec_vars[i];
+ 	}
+ 
++	ps5_drop_gpr_cache();
++	m_ps5_fallthrough = false;
++	m_ps5_entry.clear();
++	m_ps5_cold.clear();
++
+ 	label_stop = c->newLabel();
+ 	Label label_diff = c->newLabel();
+ 	Label label_code = c->newLabel();
+@@ -168,6 +177,9 @@ spu_function_t spu_recompiler::compile(spu_program&& _func)
+ 	m_pos = func.lower_bound;
+ 	m_base = func.entry_point;
+ 	m_size = ::size32(func.data) * 4;
++	m_ps5_words = func.data.data();
++	m_ps5_start = func.lower_bound;
++	m_ps5_count = ::size32(func.data);
+ 	const u32 start = m_pos;
+ 	const u32 end = start + m_size;
+ 
+@@ -779,10 +791,12 @@ spu_function_t spu_recompiler::compile(spu_program&& _func)
+ 			if (m_pos + 1)
+ 			{
+ 				spu_log.error("Unexpected fallthrough to 0x%x", pos);
++				ps5_flush_dirty();
+ 				branch_fixed(spu_branch_target(pos));
+ 				m_pos = -1;
+ 			}
+ 
++			m_ps5_fallthrough = false;
+ 			continue;
+ 		}
+ 
+@@ -794,6 +808,48 @@ spu_function_t spu_recompiler::compile(spu_program&& _func)
+ 
+ 		if (found != instr_labels.end())
+ 		{
++			// Fallthrough writes deferred results before any other entry reloads them.
++			ps5_flush_dirty();
++
++			if (ps5_inherit_label(pos))
++			{
++				std::array<s8, 16> owners{};
++
++				for (u32 slot = 0; slot < 16; slot++)
++				{
++					owners[slot] = m_xmm_owner[slot];
++				}
++
++				const Label cold = c->newLabel();
++				const Label hot = found->second;
++				m_ps5_entry[pos] = owners;
++				m_ps5_cold[pos] = cold;
++
++				// Out of line so fallthrough enters the hot path with xmm intact.
++				after.emplace_back([=, this]()
++				{
++					c->align(AlignMode::kCode, 16);
++					c->bind(cold);
++
++					for (u32 slot = 0; slot < 16; slot++)
++					{
++						if (owners[slot] < 0)
++						{
++							continue;
++						}
++
++						c->movdqa(*m_xmm_reg[slot], SPU_OFF_128(gpr, owners[slot]));
++					}
++
++					c->jmp(hot);
++				});
++			}
++			else
++			{
++				// Another path can enter here, so xmm no longer matches the GPR file.
++				ps5_drop_gpr_cache();
++			}
++
+ 			if (m_preds.count(pos))
+ 			{
+ 				c->align(AlignMode::kCode, 16);
+@@ -811,19 +867,44 @@ spu_function_t spu_recompiler::compile(spu_program&& _func)
+ 		// Tracing
+ 		//c->lea(x86::r14, get_pc(m_pos));
+ 
+-		// Execute recompiler function
++		// ALU that only touches xmm can keep results there. Anything that reads
++		// the GPR file, or leaves the block, needs memory to match first.
++		m_ps5_gpr_cache = false;
++
++		if (!ps5_defer_store(op))
++		{
++			ps5_flush_dirty();
++		}
++
+ 		(this->*s_spu_decoder.decode(op))({op});
+ 
+-		// Collect allocated xmm vars
++		if (!m_ps5_gpr_cache)
++		{
++			ps5_drop_gpr_cache();
++		}
++
++		// Keep slots that still match a GPR. Everything else goes back to the pool.
+ 		for (u32 i = 0; i < vec_vars.size(); i++)
+ 		{
+-			vec[i] = vec_vars[i];
++			m_xmm_taken[i] = 0;
++
++			if (m_xmm_owner[i] >= 0)
++			{
++				vec[i] = nullptr;
++			}
++			else
++			{
++				vec[i] = vec_vars[i];
++			}
+ 		}
++
++		m_ps5_fallthrough = (m_pos + 1) != 0;
+ 	}
+ 
+ 	// Make fallthrough if necessary
+ 	if (m_pos + 1)
+ 	{
++		ps5_flush_dirty();
+ 		branch_fixed(spu_branch_target(end));
+ 	}
+ 
+@@ -862,7 +943,14 @@ spu_function_t spu_recompiler::compile(spu_program&& _func)
+ 		{
+ 			const auto found = instr_labels.find(addr);
+ 
+-			if (found != instr_labels.end())
++			const auto cold = m_ps5_cold.find(addr);
++
++			if (cold != m_ps5_cold.end())
++			{
++				// Indirect entry does not have the loop's xmm values.
++				c->embedLabel(cold->second);
++			}
++			else if (found != instr_labels.end())
+ 			{
+ 				c->embedLabel(found->second);
+ 			}
+@@ -897,7 +985,13 @@ spu_function_t spu_recompiler::compile(spu_program&& _func)
+ 	}
+ 	else
+ 	{
+-		jit_announce(fn, code.codeSize(), fmt::format("spu-b-%s", fmt::base57(be_t<u64>(m_hash_start))));
++		const std::string fname = fmt::format("spu-%05x-%s", func.entry_point, fmt::base57(be_t<u64>(m_hash_start)));
++		jit_announce(fn, code.codeSize(), fname);
++#ifdef __PROSPERO__
++		// The profiler names samples in this code after the SPU function (Utilities/Thread.cpp)
++		extern void ps5_jit_name(u64 addr, std::string name);
++		ps5_jit_name(reinterpret_cast<u64>(fn), fname);
++#endif
+ 	}
+ 
+ 	// Install compiled function pointer
+@@ -928,20 +1022,322 @@ spu_function_t spu_recompiler::compile(spu_program&& _func)
+ 	return fn;
+ }
+ 
++bool spu_recompiler::ps5_inherit_label(u32 pos) const
++{
++	if (!m_ps5_fallthrough || m_entry_info[pos / 4])
++	{
++		return false;
++	}
++
++	const auto preds = m_preds.find(pos);
++
++	if (preds == m_preds.end())
++	{
++		return false;
++	}
++
++	bool any = false;
++
++	for (u32 slot = 0; slot < 16; slot++)
++	{
++		if (m_xmm_owner[slot] >= 0)
++		{
++			any = true;
++			break;
++		}
++	}
++
++	if (!any)
++	{
++		return false;
++	}
++
++	bool saw_fall = false;
++
++	for (u32 pred : preds->second)
++	{
++		if (pred + 4 == pos)
++		{
++			saw_fall = true;
++		}
++		else if (pred < pos)
++		{
++			// Already emitted. That edge cannot be taught this xmm map.
++			return false;
++		}
++	}
++
++	return saw_fall;
++}
++
++void spu_recompiler::ps5_flush_dirty()
++{
++	if (!c)
++	{
++		return;
++	}
++
++	for (u32 i = 0; i < 16; i++)
++	{
++		if (!m_xmm_dirty[i] || m_xmm_owner[i] < 0 || !m_xmm_reg[i])
++		{
++			continue;
++		}
++
++		c->movdqa(SPU_OFF_128(gpr, m_xmm_owner[i]), *m_xmm_reg[i]);
++		m_xmm_dirty[i] = 0;
++	}
++}
++
++void spu_recompiler::ps5_drop_gpr_cache()
++{
++	ps5_flush_dirty();
++
++	for (u32 i = 0; i < 16; i++)
++	{
++		m_xmm_owner[i] = -1;
++		m_xmm_dirty[i] = 0;
++		m_xmm_taken[i] = 0;
++
++		if (m_xmm_reg[i])
++		{
++			vec[i] = m_xmm_reg[i];
++		}
++	}
++}
++
++bool spu_recompiler::ps5_note_store(s8 rt, const XmmLink& v)
++{
++	const auto* stored = &static_cast<const asmjit::x86::Xmm&>(v);
++
++	for (u32 i = 0; i < 16; i++)
++	{
++		if (m_xmm_reg[i] != stored)
++		{
++			continue;
++		}
++
++		for (u32 j = 0; j < 16; j++)
++		{
++			if (j != i && m_xmm_owner[j] == rt)
++			{
++				// This instruction overwrites that copy. Do not flush it back.
++				m_xmm_owner[j] = -1;
++				m_xmm_dirty[j] = 0;
++			}
++		}
++
++		m_xmm_owner[i] = rt;
++		m_xmm_taken[i] = 0;
++		m_xmm_dirty[i] = 0;
++		return true;
++	}
++
++	return false;
++}
++
++void spu_recompiler::gpr_store(s8 rt, const XmmLink& v)
++{
++	c->movdqa(SPU_OFF_128(gpr, rt), v);
++	ps5_note_store(rt, v);
++}
++
++void spu_recompiler::gpr_store_ps(s8 rt, const XmmLink& v)
++{
++	c->movaps(SPU_OFF_128(gpr, rt), v);
++	ps5_note_store(rt, v);
++}
++
++void spu_recompiler::gpr_store_pd(s8 rt, const XmmLink& v)
++{
++	c->movapd(SPU_OFF_128(gpr, rt), v);
++	ps5_note_store(rt, v);
++}
++
++bool spu_recompiler::ps5_defer_store(u32 opcode) const
++{
++	const auto type = g_spu_itype.decode(opcode);
++
++	if (!(type & spu_itype::integer) && !(type & spu_itype::floating) && !(type & spu_itype::shiftrot) && !(type & spu_itype::compare) && !(type & spu_itype::constant))
++	{
++		return false;
++	}
++
++	// These read a GPR scalar from memory, or write the result past the cache.
++	if (type == spu_itype::ROT || type == spu_itype::ROTM || type == spu_itype::ROTMA || type == spu_itype::SHL ||
++		type == spu_itype::ROTQBY || type == spu_itype::ROTQMBY || type == spu_itype::SHLQBY ||
++		type == spu_itype::ROTQBYBI || type == spu_itype::ROTQMBYBI || type == spu_itype::SHLQBYBI ||
++		type == spu_itype::CBX || type == spu_itype::CHX || type == spu_itype::CWX || type == spu_itype::CDX ||
++		type == spu_itype::CBD || type == spu_itype::CHD || type == spu_itype::CWD || type == spu_itype::CDD ||
++		type == spu_itype::XSWD)
++	{
++		return false;
++	}
++
++	return true;
++}
++
++u32 spu_recompiler::ps5_src_count(s8 reg) const
++{
++	if (!m_ps5_words || reg < 0)
++	{
++		return 2;
++	}
++
++	const u32 i = (m_pos - m_ps5_start) / 4;
++
++	if (i >= m_ps5_count)
++	{
++		return 2;
++	}
++
++	const u32 opcode = std::bit_cast<be_t<u32>>(m_ps5_words[i]);
++	const auto [rt, srcs, masked] = op_register_targets(m_pos, spu_opcode_t{opcode});
++	(void)rt;
++	(void)masked;
++	u32 n = 0;
++
++	for (u32 s : srcs)
++	{
++		if (s == static_cast<u32>(reg))
++		{
++			n++;
++		}
++	}
++
++	return n;
++}
++
++bool spu_recompiler::ps5_src_dead(s8 reg) const
++{
++	if (!m_ps5_words || reg < 0)
++	{
++		return false;
++	}
++
++	for (u32 pos = m_pos + 4; ; pos += 4)
++	{
++		if (pos / 4 >= (SPU_LS_SIZE / 4) || m_block_info[pos / 4])
++		{
++			return false;
++		}
++
++		const u32 i = (pos - m_ps5_start) / 4;
++
++		if (i >= m_ps5_count)
++		{
++			return false;
++		}
++
++		const u32 opcode = std::bit_cast<be_t<u32>>(m_ps5_words[i]);
++
++		if (!opcode)
++		{
++			return false;
++		}
++
++		const auto type = g_spu_itype.decode(opcode);
++		const auto [rt, srcs, masked] = op_register_targets(pos, spu_opcode_t{opcode});
++		(void)masked;
++
++		for (u32 s : srcs)
++		{
++			if (s == static_cast<u32>(reg))
++			{
++				return false;
++			}
++		}
++
++		if (rt != u32{umax} && rt == static_cast<u32>(reg))
++		{
++			return true;
++		}
++
++		if ((type & spu_itype::branch) || type == spu_itype::STOP || type == spu_itype::STOPD || !g_spu_iflag.decode(opcode))
++		{
++			return false;
++		}
++	}
++}
++
+ spu_recompiler::XmmLink spu_recompiler::XmmAlloc() // get empty xmm register
+ {
+-	for (auto& v : vec)
++	for (u32 i = 0; i < vec.size(); i++)
+ 	{
+-		if (v) return{ v };
++		if (!vec[i])
++		{
++			continue;
++		}
++
++		m_xmm_taken[i] = 1;
++		m_xmm_owner[i] = -1;
++		return {vec[i]};
++	}
++
++	// Write a deferred result back before its xmm is reused.
++	for (u32 i = 0; i < vec.size(); i++)
++	{
++		if (m_xmm_owner[i] < 0 || m_xmm_taken[i])
++		{
++			continue;
++		}
++
++		if (m_xmm_dirty[i] && m_xmm_reg[i])
++		{
++			c->movdqa(SPU_OFF_128(gpr, m_xmm_owner[i]), *m_xmm_reg[i]);
++		}
++
++		m_xmm_owner[i] = -1;
++		m_xmm_dirty[i] = 0;
++		vec[i] = m_xmm_reg[i];
++		m_xmm_taken[i] = 1;
++		return {vec[i]};
+ 	}
+ 
+ 	fmt::throw_exception("Out of Xmm Vars");
+ }
+ 
+-spu_recompiler::XmmLink spu_recompiler::XmmGet(s8 reg, XmmType type) // get xmm register with specific SPU reg
++spu_recompiler::XmmLink spu_recompiler::XmmGet(s8 reg, XmmType type, s8 dest)
+ {
++	u32 slot = 16;
++
++	for (u32 i = 0; i < vec.size(); i++)
++	{
++		if (m_xmm_owner[i] != reg || m_xmm_taken[i])
++		{
++			continue;
++		}
++
++		slot = i;
++		break;
++	}
++
++	// Overwriting this register: modify its xmm directly so an accumulator chain
++	// does not pay for a copy. Memory still holds the old value until gpr_store.
++	if (slot < 16 && dest >= 0 && dest == reg)
++	{
++		vec[slot] = m_xmm_reg[slot];
++		m_xmm_taken[slot] = 1;
++		m_xmm_owner[slot] = -1;
++		m_xmm_dirty[slot] = 0;
++		return {vec[slot]};
++	}
++
+ 	XmmLink result = XmmAlloc();
+ 
++	if (slot < 16 && m_xmm_owner[slot] == reg && m_xmm_reg[slot])
++	{
++		switch (type)
++		{
++		case XmmType::Int: c->movdqa(result, *m_xmm_reg[slot]); break;
++		case XmmType::Float: c->movaps(result, *m_xmm_reg[slot]); break;
++		case XmmType::Double: c->movapd(result, *m_xmm_reg[slot]); break;
++		default: fmt::throw_exception("Invalid XmmType");
++		}
++
++		return result;
++	}
++
+ 	switch (type)
+ 	{
+ 	case XmmType::Int: c->movdqa(result, SPU_OFF_128(gpr, reg)); break;
+@@ -953,6 +1349,32 @@ spu_recompiler::XmmLink spu_recompiler::XmmGet(s8 reg, XmmType type) // get xmm
+ 	return result;
+ }
+ 
++const asmjit::x86::Xmm* spu_recompiler::ps5_gpr_xmm(s8 reg) const
++{
++	for (u32 i = 0; i < 16; i++)
++	{
++		if (m_xmm_owner[i] == reg && !m_xmm_taken[i] && m_xmm_reg[i])
++		{
++			return m_xmm_reg[i];
++		}
++	}
++
++	return nullptr;
++}
++
++template <typename Emit>
++void spu_recompiler::ps5_with_gpr(s8 src, Emit emit)
++{
++	if (const auto* live = ps5_gpr_xmm(src))
++	{
++		emit(*live);
++	}
++	else
++	{
++		emit(SPU_OFF_128(gpr, src));
++	}
++}
++
+ inline asmjit::x86::Mem spu_recompiler::XmmConst(const v128& data)
+ {
+ 	// Find existing const
+@@ -991,6 +1413,9 @@ void spu_recompiler::branch_fixed(u32 target, bool absolute)
+ {
+ 	using namespace asmjit;
+ 
++	// The next block, and check_state, read the GPR file.
++	ps5_flush_dirty();
++
+ 	// Check local branch
+ 	const auto local = instr_labels.find(target);
+ 
+@@ -1005,14 +1430,59 @@ void spu_recompiler::branch_fixed(u32 target, bool absolute)
+ 			c->jne(fail);
+ 		}
+ 
+-		c->cmp(SPU_OFF_32(state), 0);
+-		c->jz(local->second);
+-		c->lea(addr->r64(), get_pc(target));
+-		c->and_(*addr, 0x3fffc);
+-		c->mov(SPU_OFF_32(pc), *addr);
+-		c->mov(*arg0, *cpu);
+-		c->call(&check_state);
+-		c->jmp(local->second);
++		const auto entry = m_ps5_entry.find(target);
++		const auto cold = m_ps5_cold.find(target);
++
++		if (entry != m_ps5_entry.end() && cold != m_ps5_cold.end())
++		{
++			bool mismatch = false;
++
++			for (u32 slot = 0; slot < 16; slot++)
++			{
++				if (entry->second[slot] >= 0 && m_xmm_owner[slot] != entry->second[slot])
++				{
++					mismatch = true;
++					break;
++				}
++			}
++
++			Label slow = c->newLabel();
++			c->cmp(SPU_OFF_32(state), 0);
++			c->jnz(slow);
++
++			if (mismatch)
++			{
++				for (u32 slot = 0; slot < 16; slot++)
++				{
++					if (entry->second[slot] < 0 || m_xmm_owner[slot] == entry->second[slot])
++					{
++						continue;
++					}
++
++					c->movdqa(*m_xmm_reg[slot], SPU_OFF_128(gpr, entry->second[slot]));
++				}
++			}
++
++			c->jmp(local->second);
++			c->bind(slow);
++			c->lea(addr->r64(), get_pc(target));
++			c->and_(*addr, 0x3fffc);
++			c->mov(SPU_OFF_32(pc), *addr);
++			c->mov(*arg0, *cpu);
++			c->call(&check_state);
++			c->jmp(cold->second);
++		}
++		else
++		{
++			c->cmp(SPU_OFF_32(state), 0);
++			c->jz(local->second);
++			c->lea(addr->r64(), get_pc(target));
++			c->and_(*addr, 0x3fffc);
++			c->mov(SPU_OFF_32(pc), *addr);
++			c->mov(*arg0, *cpu);
++			c->call(&check_state);
++			c->jmp(local->second);
++		}
+ 
+ 		if (absolute)
+ 		{
+@@ -1056,6 +1526,8 @@ void spu_recompiler::branch_indirect(spu_opcode_t op, bool jt, bool ret)
+ {
+ 	using namespace asmjit;
+ 
++	ps5_flush_dirty();
++
+ 	// Initialize third arg to zero
+ 	c->xor_(rip->r32(), rip->r32());
+ 
+@@ -1290,6 +1762,7 @@ void spu_recompiler::STOP(spu_opcode_t op)
+ 
+ void spu_recompiler::LNOP(spu_opcode_t)
+ {
++	m_ps5_gpr_cache = true;
+ }
+ 
+ void spu_recompiler::SYNC(spu_opcode_t)
+@@ -1626,77 +2099,129 @@ void spu_recompiler::RCHCNT(spu_opcode_t op)
+ 
+ void spu_recompiler::SF(spu_opcode_t op)
+ {
+-	// sub from
+-	const XmmLink& vb = XmmGet(op.rb, XmmType::Int);
+-	c->psubd(vb, SPU_OFF_128(gpr, op.ra));
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), vb);
++	m_ps5_gpr_cache = true;
++	// rt = rb - ra. AVX writes a new xmm and leaves both sources alone.
++	if (utils::has_avx())
++	{
++		const auto* xa = ps5_gpr_xmm(op.ra);
++		const auto* xb = ps5_gpr_xmm(op.rb);
++		const XmmLink& vd = XmmAlloc();
++
++		if (xa && xb)
++			c->vpsubd(vd, *xb, *xa);
++		else if (xb)
++			c->vpsubd(vd, *xb, SPU_OFF_128(gpr, op.ra));
++		else
++		{
++			c->vmovdqa(vd, SPU_OFF_128(gpr, op.rb));
++			if (xa)
++				c->psubd(vd, *xa);
++			else
++				c->psubd(vd, SPU_OFF_128(gpr, op.ra));
++		}
++
++		gpr_store(op.rt, vd);
++		return;
++	}
++
++	const XmmLink& vb = XmmGet(op.rb, XmmType::Int, op.rt);
++	ps5_with_gpr(op.ra, [&](const auto& src) { c->psubd(vb, src); });
++	gpr_store(op.rt, vb);
+ }
+ 
+ void spu_recompiler::OR(spu_opcode_t op)
+ {
+-	const XmmLink& vb = XmmGet(op.rb, XmmType::Int);
+-	c->por(vb, SPU_OFF_128(gpr, op.ra));
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), vb);
++	m_ps5_gpr_cache = true;
++
++	if (utils::has_avx())
++	{
++		const auto* xa = ps5_gpr_xmm(op.ra);
++		const auto* xb = ps5_gpr_xmm(op.rb);
++		const XmmLink& vd = XmmAlloc();
++
++		if (xa && xb)
++			c->vpor(vd, *xa, *xb);
++		else if (xa)
++			c->vpor(vd, *xa, SPU_OFF_128(gpr, op.rb));
++		else if (xb)
++			c->vpor(vd, *xb, SPU_OFF_128(gpr, op.ra));
++		else
++		{
++			c->vmovdqa(vd, SPU_OFF_128(gpr, op.ra));
++			c->por(vd, SPU_OFF_128(gpr, op.rb));
++		}
++
++		gpr_store(op.rt, vd);
++		return;
++	}
++
++	const XmmLink& vb = XmmGet(op.rb, XmmType::Int, op.rt);
++	ps5_with_gpr(op.ra, [&](const auto& src) { c->por(vb, src); });
++	gpr_store(op.rt, vb);
+ }
+ 
+ void spu_recompiler::BG(spu_opcode_t op)
+ {
++	m_ps5_gpr_cache = true;
+ 	// compare if-greater-than
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
+ 	const XmmLink& vi = XmmAlloc();
+ 
+ 	if (utils::has_avx512())
+ 	{
+-		const XmmLink& vb = XmmGet(op.rb, XmmType::Int);
++		const XmmLink& vb = XmmGet(op.rb, XmmType::Int, op.rt);
+ 		c->vpsubd(vi, vb, va);
+ 		c->vpternlogd(va, vb, vi, 0x4d /* B?nandAC:norAC */);
+ 		c->psrld(va, 31);
+-		c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++		gpr_store(op.rt, va);
+ 		return;
+ 	}
+ 
+ 	c->movdqa(vi, XmmConst(v128::from32p(0x80000000)));
+ 	c->pxor(va, vi);
+-	c->pxor(vi, SPU_OFF_128(gpr, op.rb));
++	ps5_with_gpr(op.rb, [&](const auto& src) { c->pxor(vi, src); });
+ 	c->pcmpgtd(va, vi);
+ 	c->paddd(va, XmmConst(v128::from32p(1)));
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::SFH(spu_opcode_t op)
+ {
++	m_ps5_gpr_cache = true;
+ 	// sub from (halfword)
+-	const XmmLink& vb = XmmGet(op.rb, XmmType::Int);
+-	c->psubw(vb, SPU_OFF_128(gpr, op.ra));
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), vb);
++	const XmmLink& vb = XmmGet(op.rb, XmmType::Int, op.rt);
++	ps5_with_gpr(op.ra, [&](const auto& src) { c->psubw(vb, src); });
++	gpr_store(op.rt, vb);
+ }
+ 
+ void spu_recompiler::NOR(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
+ 
+ 	if (utils::has_avx512())
+ 	{
+-		c->vpternlogd(va, va, SPU_OFF_128(gpr, op.rb), 0x11 /* norCB */);
+-		c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++		ps5_with_gpr(op.rb, [&](const auto& src) { c->vpternlogd(va, va, src, 0x11 /* norCB */); });
++		gpr_store(op.rt, va);
+ 		return;
+ 	}
+ 
+-	c->por(va, SPU_OFF_128(gpr, op.rb));
++	ps5_with_gpr(op.rb, [&](const auto& src) { c->por(va, src); });
+ 	c->pxor(va, XmmConst(v128::from32p(0xffffffff)));
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::ABSDB(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
+-	const XmmLink& vb = XmmGet(op.rb, XmmType::Int);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
++	const XmmLink& vb = XmmGet(op.rb, XmmType::Int, op.rt);
+ 	const XmmLink& vm = XmmAlloc();
+ 	c->movdqa(vm, va);
+ 	c->pmaxub(va, vb);
+ 	c->pminub(vb, vm);
+ 	c->psubb(va, vb);
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::ROT(spu_opcode_t op)
+@@ -1863,8 +2388,9 @@ void spu_recompiler::SHL(spu_opcode_t op)
+ 
+ void spu_recompiler::ROTH(spu_opcode_t op) //nf
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
+-	const XmmLink& vb = XmmGet(op.rb, XmmType::Int);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
++	const XmmLink& vb = XmmGet(op.rb, XmmType::Int, op.rt);
+ 	
+ 	if (utils::has_avx512_icl())
+ 	{
+@@ -1893,7 +2419,7 @@ void spu_recompiler::ROTH(spu_opcode_t op) //nf
+ 	{
+ 		const XmmLink& vt = XmmAlloc();
+ 		c->vprotw(vt, va, vb);
+-		c->movdqa(SPU_OFF_128(gpr, op.rt), vt);
++		gpr_store(op.rt, vt);
+ 		return;
+ 	}
+ 
+@@ -1917,13 +2443,14 @@ void spu_recompiler::ROTH(spu_opcode_t op) //nf
+ 	c->pmullw(v2, vb);
+ 	c->pmulhuw(va, vb);
+ 	c->por(va, v2);
+-	c->vmovdqa(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::ROTHM(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
+-	const XmmLink& vb = XmmGet(op.rb, XmmType::Int);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
++	const XmmLink& vb = XmmGet(op.rb, XmmType::Int, op.rt);
+ 
+ 	if (utils::has_avx512())
+ 	{
+@@ -1931,7 +2458,7 @@ void spu_recompiler::ROTHM(spu_opcode_t op)
+ 		c->psubw(vb, XmmConst(v128::from16p(1)));
+ 		c->pandn(vb, XmmConst(v128::from16p(0x1f)));
+ 		c->vpsrlvw(vt, va, vb);
+-		c->movdqa(SPU_OFF_128(gpr, op.rt), vt);
++		gpr_store(op.rt, vt);
+ 		return;
+ 	}
+ 
+@@ -1949,7 +2476,7 @@ void spu_recompiler::ROTHM(spu_opcode_t op)
+ 		c->vpsrlvd(va, va, v4);
+ 		c->vpsrlvd(vb, vb, v5);
+ 		c->vpblendw(vt, vb, va, 0xaa); // can use vpblendvb with 0xffff0000 mask (vt)
+-		c->movdqa(SPU_OFF_128(gpr, op.rt), vt);
++		gpr_store(op.rt, vt);
+ 		return;
+ 	}
+ 
+@@ -1963,7 +2490,7 @@ void spu_recompiler::ROTHM(spu_opcode_t op)
+ 		c->pcmpgtw(vb, XmmConst(v128::from16p(15)));
+ 		c->vpshlw(vt, va, vt);
+ 		c->vpandn(vt, vb, vt);
+-		c->movdqa(SPU_OFF_128(gpr, op.rt), vt);
++		gpr_store(op.rt, vt);
+ 		return;
+ 	}
+ 
+@@ -1991,13 +2518,14 @@ void spu_recompiler::ROTHM(spu_opcode_t op)
+ 	c->psubw(vb, v1);
+ 	c->pmulhuw(va, vb);		// high multiply "shifts" right by 16
+ 	c->por(va, vt);			// (amt == 0)? x : (x >> (32 - amt))
+-	c->vmovdqa(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::ROTMAH(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
+-	const XmmLink& vb = XmmGet(op.rb, XmmType::Int);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
++	const XmmLink& vb = XmmGet(op.rb, XmmType::Int, op.rt);
+ 
+ 	if (utils::has_avx512())
+ 	{
+@@ -2005,7 +2533,7 @@ void spu_recompiler::ROTMAH(spu_opcode_t op)
+ 		c->psubw(vb, XmmConst(v128::from16p(1)));
+ 		c->pandn(vb, XmmConst(v128::from16p(0x1f)));
+ 		c->vpsravw(vt, va, vb);
+-		c->movdqa(SPU_OFF_128(gpr, op.rt), vt);
++		gpr_store(op.rt, vt);
+ 		return;
+ 	}
+ 
+@@ -2025,7 +2553,7 @@ void spu_recompiler::ROTMAH(spu_opcode_t op)
+ 		c->vpsravd(va, va, v4);
+ 		c->vpsravd(vb, vb, v5);
+ 		c->vpblendw(vt, vb, va, 0xaa);
+-		c->movdqa(SPU_OFF_128(gpr, op.rt), vt);
++		gpr_store(op.rt, vt);
+ 		return;
+ 	}
+ 
+@@ -2038,7 +2566,7 @@ void spu_recompiler::ROTMAH(spu_opcode_t op)
+ 		c->pminuw(vb, XmmConst(v128::from16p(15)));
+ 		c->psubw(vt, vb);
+ 		c->vpshaw(vt, va, vt);
+-		c->movdqa(SPU_OFF_128(gpr, op.rt), vt);
++		gpr_store(op.rt, vt);
+ 		return;
+ 	}
+ 
+@@ -2070,20 +2598,21 @@ void spu_recompiler::ROTMAH(spu_opcode_t op)
+ 	c->pmullw(vb, vt);
+ 	c->pmulhuw(va, vt);
+ 	c->por(va, vb);			// fshr((x>>15), x, amt)
+-	c->vmovdqa(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::SHLH(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
+-	const XmmLink& vb = XmmGet(op.rb, XmmType::Int);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
++	const XmmLink& vb = XmmGet(op.rb, XmmType::Int, op.rt);
+ 
+ 	if (utils::has_avx512())
+ 	{
+ 		const XmmLink& vt = XmmAlloc();
+ 		c->pand(vb, XmmConst(v128::from16p(0x1f)));
+ 		c->vpsllvw(vt, va, vb);
+-		c->movdqa(SPU_OFF_128(gpr, op.rt), vt);
++		gpr_store(op.rt, vt);
+ 		return;
+ 	}
+ 
+@@ -2100,7 +2629,7 @@ void spu_recompiler::SHLH(spu_opcode_t op)
+ 		c->vpsllvd(va, va, v5);
+ 		c->vpsllvd(vb, vb, v4);
+ 		c->vpblendw(vt, vb, va, 0x55);
+-		c->movdqa(SPU_OFF_128(gpr, op.rt), vt);
++		gpr_store(op.rt, vt);
+ 		return;
+ 	}
+ 
+@@ -2111,7 +2640,7 @@ void spu_recompiler::SHLH(spu_opcode_t op)
+ 		c->vpcmpgtw(vt, vb, XmmConst(v128::from16p(15)));
+ 		c->vpshlw(vb, va, vb);
+ 		c->pandn(vt, vb);
+-		c->movdqa(SPU_OFF_128(gpr, op.rt), vt);
++		gpr_store(op.rt, vt);
+ 		return;
+ 	}
+ 
+@@ -2132,125 +2661,181 @@ void spu_recompiler::SHLH(spu_opcode_t op)
+ 	c->pxor(vb, vb);
+ 	c->psubw(vb, va);		// can negate either
+ 	c->pmullw(vb, v1);
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), vb);
++	gpr_store(op.rt, vb);
+ }
+ 
+ void spu_recompiler::ROTI(spu_opcode_t op)
+ {
++	m_ps5_gpr_cache = true;
+ 	// rotate left
+ 	const int s = op.i7 & 0x1f;
+ 
+ 	if (utils::has_avx512())
+ 	{
+-		const XmmLink& va = XmmGet(op.ra, XmmType::Int);
++		const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
+ 		c->vprold(va, va, s);
+-		c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++		gpr_store(op.rt, va);
+ 		return;
+ 	}
+ 
+ 	if (utils::has_xop())
+ 	{
+-		const XmmLink& va = XmmGet(op.ra, XmmType::Int);
++		const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
+ 		c->vprotd(va, va, s);
+-		c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++		gpr_store(op.rt, va);
+ 		return;
+ 	}
+ 
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
+ 	const XmmLink& v1 = XmmAlloc();
+ 	c->movdqa(v1, va);
+ 	c->pslld(va, s);
+ 	c->psrld(v1, 32 - s);
+ 	c->por(va, v1);
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::ROTMI(spu_opcode_t op)
+ {
++	m_ps5_gpr_cache = true;
+ 	// shift right logical
+ 	const int s = (0 - op.i7) & 0x3f;
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
+ 	c->psrld(va, s);
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::ROTMAI(spu_opcode_t op)
+ {
++	m_ps5_gpr_cache = true;
+ 	// shift right arithmetical
+ 	const int s = (0 - op.i7) & 0x3f;
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
+ 	c->psrad(va, s);
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::SHLI(spu_opcode_t op)
+ {
++	m_ps5_gpr_cache = true;
+ 	// shift left
+ 	const int s = op.i7 & 0x3f;
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
+ 	c->pslld(va, s);
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::ROTHI(spu_opcode_t op)
+ {
++	m_ps5_gpr_cache = true;
+ 	// rotate left (halfword)
+ 	const int s = op.i7 & 0xf;
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
+ 	const XmmLink& v1 = XmmAlloc();
+ 	c->movdqa(v1, va);
+ 	c->psllw(va, s);
+ 	c->psrlw(v1, 16 - s);
+ 	c->por(va, v1);
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::ROTHMI(spu_opcode_t op)
+ {
++	m_ps5_gpr_cache = true;
+ 	// shift right logical
+ 	const int s = (0 - op.i7) & 0x1f;
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
+ 	c->psrlw(va, s);
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::ROTMAHI(spu_opcode_t op)
+ {
++	m_ps5_gpr_cache = true;
+ 	// shift right arithmetical (halfword)
+ 	const int s = (0 - op.i7) & 0x1f;
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
+ 	c->psraw(va, s);
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::SHLHI(spu_opcode_t op)
+ {
++	m_ps5_gpr_cache = true;
+ 	// shift left (halfword)
+ 	const int s = op.i7 & 0x1f;
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
+ 	c->psllw(va, s);
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::A(spu_opcode_t op)
+ {
+-	const XmmLink& vb = XmmGet(op.rb, XmmType::Int);
+-	c->paddd(vb, SPU_OFF_128(gpr, op.ra));
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), vb);
++	m_ps5_gpr_cache = true;
++
++	if (utils::has_avx())
++	{
++		const auto* xa = ps5_gpr_xmm(op.ra);
++		const auto* xb = ps5_gpr_xmm(op.rb);
++		const XmmLink& vd = XmmAlloc();
++
++		if (xa && xb)
++			c->vpaddd(vd, *xa, *xb);
++		else if (xa)
++			c->vpaddd(vd, *xa, SPU_OFF_128(gpr, op.rb));
++		else if (xb)
++			c->vpaddd(vd, *xb, SPU_OFF_128(gpr, op.ra));
++		else
++		{
++			c->vmovdqa(vd, SPU_OFF_128(gpr, op.ra));
++			c->paddd(vd, SPU_OFF_128(gpr, op.rb));
++		}
++
++		gpr_store(op.rt, vd);
++		return;
++	}
++
++	const XmmLink& vb = XmmGet(op.rb, XmmType::Int, op.rt);
++	ps5_with_gpr(op.ra, [&](const auto& src) { c->paddd(vb, src); });
++	gpr_store(op.rt, vb);
+ }
+ 
+ void spu_recompiler::AND(spu_opcode_t op)
+ {
+-	// and
+-	const XmmLink& vb = XmmGet(op.rb, XmmType::Int);
+-	c->pand(vb, SPU_OFF_128(gpr, op.ra));
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), vb);
++	m_ps5_gpr_cache = true;
++
++	if (utils::has_avx())
++	{
++		const auto* xa = ps5_gpr_xmm(op.ra);
++		const auto* xb = ps5_gpr_xmm(op.rb);
++		const XmmLink& vd = XmmAlloc();
++
++		if (xa && xb)
++			c->vpand(vd, *xa, *xb);
++		else if (xa)
++			c->vpand(vd, *xa, SPU_OFF_128(gpr, op.rb));
++		else if (xb)
++			c->vpand(vd, *xb, SPU_OFF_128(gpr, op.ra));
++		else
++		{
++			c->vmovdqa(vd, SPU_OFF_128(gpr, op.ra));
++			c->pand(vd, SPU_OFF_128(gpr, op.rb));
++		}
++
++		gpr_store(op.rt, vd);
++		return;
++	}
++
++	const XmmLink& vb = XmmGet(op.rb, XmmType::Int, op.rt);
++	ps5_with_gpr(op.ra, [&](const auto& src) { c->pand(vb, src); });
++	gpr_store(op.rt, vb);
+ }
+ 
+ void spu_recompiler::CG(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
+-	const XmmLink& vb = XmmGet(op.rb, XmmType::Int);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
++	const XmmLink& vb = XmmGet(op.rb, XmmType::Int, op.rt);
+ 	const XmmLink& vi = XmmAlloc();
+ 
+ 	if (utils::has_avx512())
+@@ -2258,7 +2843,7 @@ void spu_recompiler::CG(spu_opcode_t op)
+ 		c->vpaddd(vi, vb, va);
+ 		c->vpternlogd(vi, va, vb, 0x8e /* A?andBC:orBC */);
+ 		c->psrld(vi, 31);
+-		c->movdqa(SPU_OFF_128(gpr, op.rt), vi);
++		gpr_store(op.rt, vi);
+ 		return;
+ 	}
+ 
+@@ -2268,38 +2853,41 @@ void spu_recompiler::CG(spu_opcode_t op)
+ 	c->pxor(vb, vi);
+ 	c->pcmpgtd(va, vb);
+ 	c->psrld(va, 31);
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::AH(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
+-	c->paddw(va, SPU_OFF_128(gpr, op.rb));
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
++	ps5_with_gpr(op.rb, [&](const auto& src) { c->paddw(va, src); });
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::NAND(spu_opcode_t op)
+ {
++	m_ps5_gpr_cache = true;
+ 	// nand
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
+ 
+ 	if (utils::has_avx512())
+ 	{
+-		c->vpternlogd(va, va, SPU_OFF_128(gpr, op.rb), 0x77 /* nandCB */);
+-		c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++		ps5_with_gpr(op.rb, [&](const auto& src) { c->vpternlogd(va, va, src, 0x77 /* nandCB */); });
++		gpr_store(op.rt, va);
+ 		return;
+ 	}
+ 
+-	c->pand(va, SPU_OFF_128(gpr, op.rb));
++	ps5_with_gpr(op.rb, [&](const auto& src) { c->pand(va, src); });
+ 	c->pxor(va, XmmConst(v128::from32p(0xffffffff)));
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::AVGB(spu_opcode_t op)
+ {
+-	const XmmLink& vb = XmmGet(op.rb, XmmType::Int);
+-	c->pavgb(vb, SPU_OFF_128(gpr, op.ra));
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), vb);
++	m_ps5_gpr_cache = true;
++	const XmmLink& vb = XmmGet(op.rb, XmmType::Int, op.rt);
++	ps5_with_gpr(op.ra, [&](const auto& src) { c->pavgb(vb, src); });
++	gpr_store(op.rt, vb);
+ }
+ 
+ void spu_recompiler::MTSPR(spu_opcode_t)
+@@ -2640,6 +3228,7 @@ void spu_recompiler::STQX(spu_opcode_t op)
+ 
+ 	if (utils::has_ssse3())
+ 	{
++		m_ps5_gpr_cache = true;
+ 		const XmmLink& vt = XmmGet(op.rt, XmmType::Int);
+ 		c->pshufb(vt, XmmConst(v128::from32r(0x00010203, 0x04050607, 0x08090a0b, 0x0c0d0e0f)));
+ 		c->movdqa(asmjit::x86::oword_ptr(*ls, addr->r64()), vt);
+@@ -2736,61 +3325,67 @@ void spu_recompiler::HBR([[maybe_unused]] spu_opcode_t op)
+ 
+ void spu_recompiler::GB(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
+ 	c->pslld(va, 31);
+ 	c->movmskps(*addr, va);
+ 	c->pxor(va, va);
+ 	c->pinsrw(va, *addr, 6);
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::GBH(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
+ 	c->psllw(va, 15);
+ 	c->packsswb(va, XmmConst({}));
+ 	c->pmovmskb(*addr, va);
+ 	c->pxor(va, va);
+ 	c->pinsrw(va, *addr, 6);
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::GBB(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
+ 	c->psllq(va, 7);
+ 	c->pmovmskb(*addr, va);
+ 	c->pxor(va, va);
+ 	c->pinsrw(va, *addr, 6);
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::FSM(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
+ 	const XmmLink& vm = XmmAlloc();
+ 	c->pshufd(va, va, 0xff);
+ 	c->movdqa(vm, XmmConst(v128::from32r(8, 4, 2, 1)));
+ 	c->pand(va, vm);
+ 	c->pcmpeqd(va, vm);
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::FSMH(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
+ 	const XmmLink& vm = XmmAlloc();
+ 	c->punpckhwd(va, va);
+ 	c->pshufd(va, va, 0xaa);
+ 	c->movdqa(vm, XmmConst(v128::from64r(0x0080004000200010, 0x0008000400020001)));
+ 	c->pand(va, vm);
+ 	c->pcmpeqw(va, vm);
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::FSMB(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
+ 	const XmmLink& vm = XmmAlloc();
+ 
+ 	if (utils::has_ssse3())
+@@ -2807,12 +3402,13 @@ void spu_recompiler::FSMB(spu_opcode_t op)
+ 	c->movdqa(vm, XmmConst(v128::from64p(0x8040201008040201)));
+ 	c->pand(va, vm);
+ 	c->pcmpeqb(va, vm);
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::FREST(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Float);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Float, op.rt);
+ 	const XmmLink& v_fraction = XmmAlloc();
+ 	const XmmLink& v_exponent = XmmAlloc();
+ 	const XmmLink& v_sign = XmmAlloc();
+@@ -2853,12 +3449,13 @@ void spu_recompiler::FREST(spu_opcode_t op)
+ 	c->orps(v_fraction, v_exponent);
+ 	c->orps(v_sign, v_fraction);
+ 
+-	c->movaps(SPU_OFF_128(gpr, op.rt), v_sign);
++	gpr_store_ps(op.rt, v_sign);
+ }
+ 
+ void spu_recompiler::FRSQEST(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Float);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Float, op.rt);
+ 	const XmmLink& vz = XmmAlloc();
+ 	const XmmLink& v1 = XmmAlloc();
+ 	const XmmLink& v_fraction = XmmAlloc();
+@@ -2892,7 +3489,7 @@ void spu_recompiler::FRSQEST(spu_opcode_t op)
+ 
+ 	c->orps(v_fraction, v_exponent);
+ 
+-	c->movaps(SPU_OFF_128(gpr, op.rt), v_fraction);
++	gpr_store_ps(op.rt, v_fraction);
+ }
+ 
+ void spu_recompiler::LQX(spu_opcode_t op)
+@@ -2903,10 +3500,11 @@ void spu_recompiler::LQX(spu_opcode_t op)
+ 
+ 	if (utils::has_ssse3())
+ 	{
++		m_ps5_gpr_cache = true;
+ 		const XmmLink& vt = XmmAlloc();
+ 		c->movdqa(vt, asmjit::x86::oword_ptr(*ls, addr->r64()));
+ 		c->pshufb(vt, XmmConst(v128::from32r(0x00010203, 0x04050607, 0x08090a0b, 0x0c0d0e0f)));
+-		c->movdqa(SPU_OFF_128(gpr, op.rt), vt);
++		gpr_store(op.rt, vt);
+ 	}
+ 	else
+ 	{
+@@ -3019,8 +3617,9 @@ void spu_recompiler::CDX(spu_opcode_t op)
+ 
+ void spu_recompiler::ROTQBI(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
+-	const XmmLink& vb = XmmGet(op.rb, XmmType::Int);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
++	const XmmLink& vb = XmmGet(op.rb, XmmType::Int, op.rt);
+ 	const XmmLink& vt = XmmAlloc();
+ 	const XmmLink& v4 = XmmAlloc();
+ 	c->psrldq(vb, 12);
+@@ -3031,14 +3630,15 @@ void spu_recompiler::ROTQBI(spu_opcode_t op)
+ 	c->psllq(va, vb);
+ 	c->psrlq(vt, v4);
+ 	c->por(vt, va);
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), vt);
++	gpr_store(op.rt, vt);
+ }
+ 
+ void spu_recompiler::ROTQMBI(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
+ 	const XmmLink& vb = XmmAlloc();
+-	const XmmLink& vt = XmmGet(op.rb, XmmType::Int);
++	const XmmLink& vt = XmmGet(op.rb, XmmType::Int, op.rt);
+ 	const XmmLink& v4 = XmmAlloc();
+ 	c->psrldq(vt, 12);
+ 	c->pxor(vb, vb);
+@@ -3051,13 +3651,14 @@ void spu_recompiler::ROTQMBI(spu_opcode_t op)
+ 	c->psrlq(va, vb);
+ 	c->psllq(vt, v4);
+ 	c->por(vt, va);
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), vt);
++	gpr_store(op.rt, vt);
+ }
+ 
+ void spu_recompiler::SHLQBI(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
+-	const XmmLink& vb = XmmGet(op.rb, XmmType::Int);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
++	const XmmLink& vb = XmmGet(op.rb, XmmType::Int, op.rt);
+ 	const XmmLink& vt = XmmAlloc();
+ 	const XmmLink& v4 = XmmAlloc();
+ 	c->psrldq(vb, 12);
+@@ -3069,7 +3670,7 @@ void spu_recompiler::SHLQBI(spu_opcode_t op)
+ 	c->psllq(va, vb);
+ 	c->psrlq(vt, v4);
+ 	c->por(vt, va);
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), vt);
++	gpr_store(op.rt, vt);
+ }
+ 
+ void spu_recompiler::ROTQBY(spu_opcode_t op)
+@@ -3122,14 +3723,15 @@ void spu_recompiler::SHLQBY(spu_opcode_t op)
+ 
+ void spu_recompiler::ORX(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
+ 	const XmmLink& v1 = XmmAlloc();
+ 	c->pshufd(v1, va, 0xb1);
+ 	c->por(va, v1);
+ 	c->pshufd(v1, va, 0x4e);
+ 	c->por(va, v1);
+ 	c->pslldq(va, 12);
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::CBD(spu_opcode_t op)
+@@ -3231,43 +3833,47 @@ void spu_recompiler::CDD(spu_opcode_t op)
+ 
+ void spu_recompiler::ROTQBII(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
+ 	const XmmLink& vt = XmmAlloc();
+ 	c->pshufd(vt, va, 0x4e); // swap 64-bit parts
+ 	c->psllq(va, (op.i7 & 0x7));
+ 	c->psrlq(vt, 64 - (op.i7 & 0x7));
+ 	c->por(vt, va);
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), vt);
++	gpr_store(op.rt, vt);
+ }
+ 
+ void spu_recompiler::ROTQMBII(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
+ 	const XmmLink& vt = XmmAlloc();
+ 	c->movdqa(vt, va);
+ 	c->psrldq(vt, 8);
+ 	c->psrlq(va, ((0 - op.i7) & 0x7));
+ 	c->psllq(vt, 64 - ((0 - op.i7) & 0x7));
+ 	c->por(vt, va);
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), vt);
++	gpr_store(op.rt, vt);
+ }
+ 
+ void spu_recompiler::SHLQBII(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
+ 	const XmmLink& vt = XmmAlloc();
+ 	c->movdqa(vt, va);
+ 	c->pslldq(vt, 8);
+ 	c->psllq(va, (op.i7 & 0x7));
+ 	c->psrlq(vt, 64 - (op.i7 & 0x7));
+ 	c->por(vt, va);
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), vt);
++	gpr_store(op.rt, vt);
+ }
+ 
+ void spu_recompiler::ROTQBYI(spu_opcode_t op)
+ {
++	m_ps5_gpr_cache = true;
+ 	const int s = op.i7 & 0xf;
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
+ 	const XmmLink& v2 = XmmAlloc();
+ 
+ 	if (s == 0)
+@@ -3289,78 +3895,109 @@ void spu_recompiler::ROTQBYI(spu_opcode_t op)
+ 		c->por(va, v2);
+ 	}
+ 
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::ROTQMBYI(spu_opcode_t op)
+ {
++	m_ps5_gpr_cache = true;
+ 	const int s = (0 - op.i7) & 0x1f;
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
+ 	c->psrldq(va, s);
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::SHLQBYI(spu_opcode_t op)
+ {
++	m_ps5_gpr_cache = true;
+ 	const int s = op.i7 & 0x1f;
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
+ 	c->pslldq(va, s);
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::NOP(spu_opcode_t)
+ {
++	m_ps5_gpr_cache = true;
+ }
+ 
+ void spu_recompiler::CGT(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
+-	c->pcmpgtd(va, SPU_OFF_128(gpr, op.rb));
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
++	ps5_with_gpr(op.rb, [&](const auto& src) { c->pcmpgtd(va, src); });
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::XOR(spu_opcode_t op)
+ {
+-	// xor
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
+-	c->pxor(va, SPU_OFF_128(gpr, op.rb));
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	m_ps5_gpr_cache = true;
++
++	if (utils::has_avx())
++	{
++		const auto* xa = ps5_gpr_xmm(op.ra);
++		const auto* xb = ps5_gpr_xmm(op.rb);
++		const XmmLink& vd = XmmAlloc();
++
++		if (xa && xb)
++			c->vpxor(vd, *xa, *xb);
++		else if (xa)
++			c->vpxor(vd, *xa, SPU_OFF_128(gpr, op.rb));
++		else if (xb)
++			c->vpxor(vd, *xb, SPU_OFF_128(gpr, op.ra));
++		else
++		{
++			c->vmovdqa(vd, SPU_OFF_128(gpr, op.ra));
++			c->pxor(vd, SPU_OFF_128(gpr, op.rb));
++		}
++
++		gpr_store(op.rt, vd);
++		return;
++	}
++
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
++	ps5_with_gpr(op.rb, [&](const auto& src) { c->pxor(va, src); });
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::CGTH(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
+-	c->pcmpgtw(va, SPU_OFF_128(gpr, op.rb));
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
++	ps5_with_gpr(op.rb, [&](const auto& src) { c->pcmpgtw(va, src); });
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::EQV(spu_opcode_t op)
+ {
+-	const XmmLink& vb = XmmGet(op.rb, XmmType::Int);
++	m_ps5_gpr_cache = true;
++	const XmmLink& vb = XmmGet(op.rb, XmmType::Int, op.rt);
+ 
+ 	if (utils::has_avx512())
+ 	{
+-		c->vpternlogd(vb, vb, SPU_OFF_128(gpr, op.ra), 0x99 /* xnorCB */);
+-		c->movdqa(SPU_OFF_128(gpr, op.rt), vb);
++		ps5_with_gpr(op.ra, [&](const auto& src) { c->vpternlogd(vb, vb, src, 0x99 /* xnorCB */); });
++		gpr_store(op.rt, vb);
+ 		return;
+ 	}
+ 
+ 	c->pxor(vb, XmmConst(v128::from32p(0xffffffff)));
+-	c->pxor(vb, SPU_OFF_128(gpr, op.ra));
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), vb);
++	ps5_with_gpr(op.ra, [&](const auto& src) { c->pxor(vb, src); });
++	gpr_store(op.rt, vb);
+ }
+ 
+ void spu_recompiler::CGTB(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
+-	c->pcmpgtb(va, SPU_OFF_128(gpr, op.rb));
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
++	ps5_with_gpr(op.rb, [&](const auto& src) { c->pcmpgtb(va, src); });
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::SUMB(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
+-	const XmmLink& vb = XmmGet(op.rb, XmmType::Int);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
++	const XmmLink& vb = XmmGet(op.rb, XmmType::Int, op.rt);
+ 	const XmmLink& v1 = XmmAlloc();
+ 	const XmmLink& v2 = XmmAlloc();
+ 	c->movdqa(v2, XmmConst(v128::from16p(0xff)));
+@@ -3380,7 +4017,7 @@ void spu_recompiler::SUMB(spu_opcode_t op)
+ 	c->paddw(va, v1);
+ 	c->paddw(vb, v2);
+ 	c->por(va, vb);
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::HGT(spu_opcode_t op)
+@@ -3406,13 +4043,14 @@ void spu_recompiler::HGT(spu_opcode_t op)
+ 
+ void spu_recompiler::CLZ(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
+ 
+ 	if (utils::has_avx512())
+ 	{
+ 		const XmmLink& vt = XmmAlloc();
+ 		c->vplzcntd(vt, va);
+-		c->movdqa(SPU_OFF_128(gpr, op.rt), vt);
++		gpr_store(op.rt, vt);
+ 		return;
+ 	}
+ 
+@@ -3429,7 +4067,7 @@ void spu_recompiler::CLZ(spu_opcode_t op)
+ 	c->pand(v1, XmmConst(v128::from32p(32 ^ (31 + exp_bias))));
+ 	c->pxor(v1, XmmConst(v128::from32p(31 + exp_bias)));
+ 	c->psubusw(v1, vf);	// (x==0)? 32 : 31 - (exponent - exp_bias)
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), v1);
++	gpr_store(op.rt, v1);
+ 	return;
+ }
+ 
+@@ -3443,15 +4081,17 @@ void spu_recompiler::XSWD(spu_opcode_t op)
+ 
+ void spu_recompiler::XSHW(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
+ 	c->pslld(va, 16);
+ 	c->psrad(va, 16);
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::CNTB(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
+ 	const XmmLink& v1 = XmmAlloc();
+ 	const XmmLink& vm = XmmAlloc();
+ 	c->movdqa(vm, XmmConst(v128::from8p(0x55)));
+@@ -3472,45 +4112,49 @@ void spu_recompiler::CNTB(spu_opcode_t op)
+ 	c->psrlq(v1, 4);
+ 	c->pand(v1, vm);
+ 	c->paddb(va, v1);
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::XSBH(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
+ 	c->psllw(va, 8);
+ 	c->psraw(va, 8);
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::CLGT(spu_opcode_t op)
+ {
++	m_ps5_gpr_cache = true;
+ 	// compare if-greater-than
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
+ 	const XmmLink& vi = XmmAlloc();
+ 	c->movdqa(vi, XmmConst(v128::from32p(0x80000000)));
+ 	c->pxor(va, vi);
+-	c->pxor(vi, SPU_OFF_128(gpr, op.rb));
++	ps5_with_gpr(op.rb, [&](const auto& src) { c->pxor(vi, src); });
+ 	c->pcmpgtd(va, vi);
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::ANDC(spu_opcode_t op)
+ {
++	m_ps5_gpr_cache = true;
+ 	// and not
+-	const XmmLink& vb = XmmGet(op.rb, XmmType::Int);
+-	c->pandn(vb, SPU_OFF_128(gpr, op.ra));
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), vb);
++	const XmmLink& vb = XmmGet(op.rb, XmmType::Int, op.rt);
++	ps5_with_gpr(op.ra, [&](const auto& src) { c->pandn(vb, src); });
++	gpr_store(op.rt, vb);
+ }
+ 
+ void spu_recompiler::FCGT(spu_opcode_t op)
+ {
++	m_ps5_gpr_cache = true;
+ 	// denormals are implicitly treated as zero (DAZ flag)
+ 
+ 	const XmmLink& va = XmmAlloc();
+ 	const XmmLink& vb = XmmAlloc();
+-	c->movaps(va, SPU_OFF_128(gpr, op.ra));
+-	c->movaps(vb, SPU_OFF_128(gpr, op.rb));
++	ps5_with_gpr(op.ra, [&](const auto& src) { c->movaps(va, src); });
++	ps5_with_gpr(op.rb, [&](const auto& src) { c->movaps(vb, src); });
+ 
+ 	if (utils::has_avx512())
+ 	{
+@@ -3543,7 +4187,7 @@ void spu_recompiler::FCGT(spu_opcode_t op)
+ 	c->andnps(v1, vb);
+ 
+ 	c->cmpps(v1, v0, 1 /* < */);
+-	c->movaps(SPU_OFF_128(gpr, op.rt), v1);
++	gpr_store_ps(op.rt, v1);
+ }
+ 
+ void spu_recompiler::DFCGT(spu_opcode_t op)
+@@ -3553,22 +4197,25 @@ void spu_recompiler::DFCGT(spu_opcode_t op)
+ 
+ void spu_recompiler::FA(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Float);
+-	c->addps(va, SPU_OFF_128(gpr, op.rb));
+-	c->movaps(SPU_OFF_128(gpr, op.rt), va);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Float, op.rt);
++	ps5_with_gpr(op.rb, [&](const auto& src) { c->addps(va, src); });
++	gpr_store_ps(op.rt, va);
+ }
+ 
+ void spu_recompiler::FS(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Float);
+-	c->subps(va, SPU_OFF_128(gpr, op.rb));
+-	c->movaps(SPU_OFF_128(gpr, op.rt), va);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Float, op.rt);
++	ps5_with_gpr(op.rb, [&](const auto& src) { c->subps(va, src); });
++	gpr_store_ps(op.rt, va);
+ }
+ 
+ void spu_recompiler::FM(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Float);
+-	const XmmLink& vb = XmmGet(op.rb, XmmType::Float);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Float, op.rt);
++	const XmmLink& vb = XmmGet(op.rb, XmmType::Float, op.rt);
+ 
+ 	if (utils::has_avx512())
+ 	{
+@@ -3607,47 +4254,50 @@ void spu_recompiler::FM(spu_opcode_t op)
+ 	c->andnps(vb, v0);
+ 	c->addps(va, vb);	// +0.0 + -0.0 -> +0.0 (IEEE rules). SSE propagates QNaN/extended exactly
+ 	c->andnps(v1, va);	// zero if either input is denormal/0
+-	c->movaps(SPU_OFF_128(gpr, op.rt), v1);
++	gpr_store_ps(op.rt, v1);
+ }
+ 
+ void spu_recompiler::CLGTH(spu_opcode_t op)
+ {
++	m_ps5_gpr_cache = true;
+ 	// compare if-greater-than
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
+ 	const XmmLink& vi = XmmAlloc();
+ 	c->movdqa(vi, XmmConst(v128::from16p(0x8000)));
+ 	c->pxor(va, vi);
+-	c->pxor(vi, SPU_OFF_128(gpr, op.rb));
++	ps5_with_gpr(op.rb, [&](const auto& src) { c->pxor(vi, src); });
+ 	c->pcmpgtw(va, vi);
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::ORC(spu_opcode_t op)
+ {
+-	const XmmLink& vb = XmmGet(op.rb, XmmType::Int);
++	m_ps5_gpr_cache = true;
++	const XmmLink& vb = XmmGet(op.rb, XmmType::Int, op.rt);
+ 
+ 	if (utils::has_avx512())
+ 	{
+-		c->vpternlogd(vb, vb, SPU_OFF_128(gpr, op.ra), 0xbb /* orC!B */);
+-		c->movdqa(SPU_OFF_128(gpr, op.rt), vb);
++		ps5_with_gpr(op.ra, [&](const auto& src) { c->vpternlogd(vb, vb, src, 0xbb /* orC!B */); });
++		gpr_store(op.rt, vb);
+ 		return;
+ 	}
+ 
+ 	c->pxor(vb, XmmConst(v128::from32p(0xffffffff)));
+-	c->por(vb, SPU_OFF_128(gpr, op.ra));
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), vb);
++	ps5_with_gpr(op.ra, [&](const auto& src) { c->por(vb, src); });
++	gpr_store(op.rt, vb);
+ }
+ 
+ void spu_recompiler::FCMGT(spu_opcode_t op)
+ {
++	m_ps5_gpr_cache = true;
+ 	// reverted less-than
+ 	// since comparison is absoulte, a > b if a is extended and b is not extended
+ 	// denormals are implicitly treated as zero (DAZ flag)
+ 
+ 	const XmmLink& va = XmmAlloc();
+ 	const XmmLink& vb = XmmAlloc();
+-	c->movaps(va, SPU_OFF_128(gpr, op.ra));
+-	c->movaps(vb, SPU_OFF_128(gpr, op.rb));
++	ps5_with_gpr(op.ra, [&](const auto& src) { c->movaps(va, src); });
++	ps5_with_gpr(op.rb, [&](const auto& src) { c->movaps(vb, src); });
+ 
+ 	if (utils::has_avx512())
+ 	{
+@@ -3675,7 +4325,7 @@ void spu_recompiler::FCMGT(spu_opcode_t op)
+ 	c->cmpps(vb, va, 1 /* < */);
+ 	c->pandn(v1, v0);	// a is extended well b isn't
+ 	c->orps(vb, v1);
+-	c->movaps(SPU_OFF_128(gpr, op.rt), vb);
++	gpr_store_ps(op.rt, vb);
+ }
+ 
+ void spu_recompiler::DFCMGT(spu_opcode_t op)
+@@ -3685,35 +4335,39 @@ void spu_recompiler::DFCMGT(spu_opcode_t op)
+ 
+ void spu_recompiler::DFA(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Double);
+-	c->addpd(va, SPU_OFF_128(gpr, op.rb));
+-	c->movapd(SPU_OFF_128(gpr, op.rt), va);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Double, op.rt);
++	ps5_with_gpr(op.rb, [&](const auto& src) { c->addpd(va, src); });
++	gpr_store_pd(op.rt, va);
+ }
+ 
+ void spu_recompiler::DFS(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Double);
+-	c->subpd(va, SPU_OFF_128(gpr, op.rb));
+-	c->movapd(SPU_OFF_128(gpr, op.rt), va);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Double, op.rt);
++	ps5_with_gpr(op.rb, [&](const auto& src) { c->subpd(va, src); });
++	gpr_store_pd(op.rt, va);
+ }
+ 
+ void spu_recompiler::DFM(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Double);
+-	c->mulpd(va, SPU_OFF_128(gpr, op.rb));
+-	c->movapd(SPU_OFF_128(gpr, op.rt), va);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Double, op.rt);
++	ps5_with_gpr(op.rb, [&](const auto& src) { c->mulpd(va, src); });
++	gpr_store_pd(op.rt, va);
+ }
+ 
+ void spu_recompiler::CLGTB(spu_opcode_t op)
+ {
++	m_ps5_gpr_cache = true;
+ 	// compare if-greater-than
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
+ 	const XmmLink& vi = XmmAlloc();
+ 	c->movdqa(vi, XmmConst(v128::from8p(0x80)));
+ 	c->pxor(va, vi);
+-	c->pxor(vi, SPU_OFF_128(gpr, op.rb));
++	ps5_with_gpr(op.rb, [&](const auto& src) { c->pxor(vi, src); });
+ 	c->pcmpgtb(va, vi);
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::HLGT(spu_opcode_t op)
+@@ -3739,52 +4393,58 @@ void spu_recompiler::HLGT(spu_opcode_t op)
+ 
+ void spu_recompiler::DFMA(spu_opcode_t op)
+ {
+-	const XmmLink& vr = XmmGet(op.rt, XmmType::Double);
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Double);
+-	c->mulpd(va, SPU_OFF_128(gpr, op.rb));
++	m_ps5_gpr_cache = true;
++	const XmmLink& vr = XmmGet(op.rt, XmmType::Double, op.rt);
++	const XmmLink& va = XmmGet(op.ra, XmmType::Double, op.rt);
++	ps5_with_gpr(op.rb, [&](const auto& src) { c->mulpd(va, src); });
+ 	c->addpd(vr, va);
+-	c->movapd(SPU_OFF_128(gpr, op.rt), vr);
++	gpr_store_pd(op.rt, vr);
+ }
+ 
+ void spu_recompiler::DFMS(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Double);
+-	const XmmLink& vt = XmmGet(op.rt, XmmType::Double);
+-	c->mulpd(va, SPU_OFF_128(gpr, op.rb));
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Double, op.rt);
++	const XmmLink& vt = XmmGet(op.rt, XmmType::Double, op.rt);
++	ps5_with_gpr(op.rb, [&](const auto& src) { c->mulpd(va, src); });
+ 	c->subpd(va, vt);
+-	c->movapd(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store_pd(op.rt, va);
+ }
+ 
+ void spu_recompiler::DFNMS(spu_opcode_t op)
+ {
+-	const XmmLink& vr = XmmGet(op.rt, XmmType::Double);
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Double);
+-	c->mulpd(va, SPU_OFF_128(gpr, op.rb));
++	m_ps5_gpr_cache = true;
++	const XmmLink& vr = XmmGet(op.rt, XmmType::Double, op.rt);
++	const XmmLink& va = XmmGet(op.ra, XmmType::Double, op.rt);
++	ps5_with_gpr(op.rb, [&](const auto& src) { c->mulpd(va, src); });
+ 	c->subpd(vr, va);
+-	c->movapd(SPU_OFF_128(gpr, op.rt), vr);
++	gpr_store_pd(op.rt, vr);
+ }
+ 
+ void spu_recompiler::DFNMA(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Double);
+-	const XmmLink& vt = XmmGet(op.rt, XmmType::Double);
+-	c->mulpd(va, SPU_OFF_128(gpr, op.rb));
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Double, op.rt);
++	const XmmLink& vt = XmmGet(op.rt, XmmType::Double, op.rt);
++	ps5_with_gpr(op.rb, [&](const auto& src) { c->mulpd(va, src); });
+ 	c->addpd(va, vt);
+ 	c->xorpd(va, XmmConst(v128::from64p(0x8000000000000000)));
+-	c->movapd(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store_pd(op.rt, va);
+ }
+ 
+ void spu_recompiler::CEQ(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
+-	c->pcmpeqd(va, SPU_OFF_128(gpr, op.rb));
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
++	ps5_with_gpr(op.rb, [&](const auto& src) { c->pcmpeqd(va, src); });
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::MPYHHU(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
+-	const XmmLink& vb = XmmGet(op.rb, XmmType::Int);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
++	const XmmLink& vb = XmmGet(op.rb, XmmType::Int, op.rt);
+ 	const XmmLink& va2 = XmmAlloc();
+ 	c->movdqa(va2, va);
+ 	c->pmulhuw(va, vb);
+@@ -3792,33 +4452,36 @@ void spu_recompiler::MPYHHU(spu_opcode_t op)
+ 	c->pand(va, XmmConst(v128::from32p(0xffff0000)));
+ 	c->psrld(va2, 16);
+ 	c->por(va, va2);
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::ADDX(spu_opcode_t op)
+ {
+-	const XmmLink& vt = XmmGet(op.rt, XmmType::Int);
++	m_ps5_gpr_cache = true;
++	const XmmLink& vt = XmmGet(op.rt, XmmType::Int, op.rt);
+ 	c->pand(vt, XmmConst(v128::from32p(1)));
+-	c->paddd(vt, SPU_OFF_128(gpr, op.ra));
+-	c->paddd(vt, SPU_OFF_128(gpr, op.rb));
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), vt);
++	ps5_with_gpr(op.ra, [&](const auto& src) { c->paddd(vt, src); });
++	ps5_with_gpr(op.rb, [&](const auto& src) { c->paddd(vt, src); });
++	gpr_store(op.rt, vt);
+ }
+ 
+ void spu_recompiler::SFX(spu_opcode_t op)
+ {
+-	const XmmLink& vt = XmmGet(op.rt, XmmType::Int);
+-	const XmmLink& vb = XmmGet(op.rb, XmmType::Int);
++	m_ps5_gpr_cache = true;
++	const XmmLink& vt = XmmGet(op.rt, XmmType::Int, op.rt);
++	const XmmLink& vb = XmmGet(op.rb, XmmType::Int, op.rt);
+ 	c->pandn(vt, XmmConst(v128::from32p(1)));
+-	c->psubd(vb, SPU_OFF_128(gpr, op.ra));
++	ps5_with_gpr(op.ra, [&](const auto& src) { c->psubd(vb, src); });
+ 	c->psubd(vb, vt);
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), vb);
++	gpr_store(op.rt, vb);
+ }
+ 
+ void spu_recompiler::CGX(spu_opcode_t op) //nf
+ {
+-	const XmmLink& vt = XmmGet(op.rt, XmmType::Int);
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
+-	const XmmLink& vb = XmmGet(op.rb, XmmType::Int);
++	m_ps5_gpr_cache = true;
++	const XmmLink& vt = XmmGet(op.rt, XmmType::Int, op.rt);
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
++	const XmmLink& vb = XmmGet(op.rb, XmmType::Int, op.rt);
+ 	const XmmLink& res = XmmAlloc();
+ 	const XmmLink& sign = XmmAlloc();
+ 
+@@ -3844,14 +4507,15 @@ void spu_recompiler::CGX(spu_opcode_t op) //nf
+ 	c->pand(res, vt);
+ 	c->por(res, va);
+ 	c->psrld(res, 31);
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), res);
++	gpr_store(op.rt, res);
+ }
+ 
+ void spu_recompiler::BGX(spu_opcode_t op) //nf
+ {
+-	const XmmLink& vt = XmmGet(op.rt, XmmType::Int);
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
+-	const XmmLink& vb = XmmGet(op.rb, XmmType::Int);
++	m_ps5_gpr_cache = true;
++	const XmmLink& vt = XmmGet(op.rt, XmmType::Int, op.rt);
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
++	const XmmLink& vb = XmmGet(op.rb, XmmType::Int, op.rt);
+ 	const XmmLink& temp = XmmAlloc();
+ 	const XmmLink& sign = XmmAlloc();
+ 
+@@ -3874,26 +4538,28 @@ void spu_recompiler::BGX(spu_opcode_t op) //nf
+ 	c->pcmpgtd(vb, va);
+ 	c->por(vt, vb);
+ 	c->psrld(vt, 31);
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), vt);
++	gpr_store(op.rt, vt);
+ }
+ 
+ void spu_recompiler::MPYHHA(spu_opcode_t op)
+ {
+-	const XmmLink& vt = XmmGet(op.rt, XmmType::Int);
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
+-	const XmmLink& vb = XmmGet(op.rb, XmmType::Int);
++	m_ps5_gpr_cache = true;
++	const XmmLink& vt = XmmGet(op.rt, XmmType::Int, op.rt);
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
++	const XmmLink& vb = XmmGet(op.rb, XmmType::Int, op.rt);
+ 	c->psrld(va, 16);
+ 	c->psrld(vb, 16);
+ 	c->pmaddwd(va, vb);
+ 	c->paddd(vt, va);
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), vt);
++	gpr_store(op.rt, vt);
+ }
+ 
+ void spu_recompiler::MPYHHAU(spu_opcode_t op)
+ {
+-	const XmmLink& vt = XmmGet(op.rt, XmmType::Int);
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
+-	const XmmLink& vb = XmmGet(op.rb, XmmType::Int);
++	m_ps5_gpr_cache = true;
++	const XmmLink& vt = XmmGet(op.rt, XmmType::Int, op.rt);
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
++	const XmmLink& vb = XmmGet(op.rb, XmmType::Int, op.rt);
+ 	const XmmLink& va2 = XmmAlloc();
+ 	c->movdqa(va2, va);
+ 	c->pmulhuw(va, vb);
+@@ -3902,7 +4568,7 @@ void spu_recompiler::MPYHHAU(spu_opcode_t op)
+ 	c->psrld(va2, 16);
+ 	c->paddd(vt, va);
+ 	c->paddd(vt, va2);
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), vt);
++	gpr_store(op.rt, vt);
+ }
+ 
+ void spu_recompiler::FSCRRD(spu_opcode_t op)
+@@ -3915,18 +4581,20 @@ void spu_recompiler::FSCRRD(spu_opcode_t op)
+ 
+ void spu_recompiler::FESD(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Float);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Float, op.rt);
+ 	c->shufps(va, va, 0x8d); // _f[0] = _f[1]; _f[1] = _f[3];
+ 	c->cvtps2pd(va, va);
+-	c->movapd(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store_pd(op.rt, va);
+ }
+ 
+ void spu_recompiler::FRDS(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Double);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Double, op.rt);
+ 	c->cvtpd2ps(va, va);
+ 	c->shufps(va, va, 0x72); // _f[1] = _f[0]; _f[3] = _f[1]; _f[0] = _f[2] = 0;
+-	c->movaps(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store_ps(op.rt, va);
+ }
+ 
+ void spu_recompiler::FSCRWR(spu_opcode_t /*op*/)
+@@ -3941,10 +4609,11 @@ void spu_recompiler::DFTSV(spu_opcode_t op)
+ 
+ void spu_recompiler::FCEQ(spu_opcode_t op)
+ {
++	m_ps5_gpr_cache = true;
+ 	// compare equal
+-	const XmmLink& vb = XmmGet(op.rb, XmmType::Float);
+-	c->cmpps(vb, SPU_OFF_128(gpr, op.ra), 0);
+-	c->movaps(SPU_OFF_128(gpr, op.rt), vb);
++	const XmmLink& vb = XmmGet(op.rb, XmmType::Float, op.rt);
++	ps5_with_gpr(op.ra, [&](const auto& src) { c->cmpps(vb, src, 0); });
++	gpr_store_ps(op.rt, vb);
+ }
+ 
+ void spu_recompiler::DFCEQ(spu_opcode_t op)
+@@ -3954,62 +4623,68 @@ void spu_recompiler::DFCEQ(spu_opcode_t op)
+ 
+ void spu_recompiler::MPY(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
+-	const XmmLink& vb = XmmGet(op.rb, XmmType::Int);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
++	const XmmLink& vb = XmmGet(op.rb, XmmType::Int, op.rt);
+ 	const XmmLink& vi = XmmAlloc();
+ 	c->movdqa(vi, XmmConst(v128::from32p(0xffff)));
+ 	c->pand(va, vi);
+ 	c->pand(vb, vi);
+ 	c->pmaddwd(va, vb);
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::MPYH(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
+-	const XmmLink& vb = XmmGet(op.rb, XmmType::Int);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
++	const XmmLink& vb = XmmGet(op.rb, XmmType::Int, op.rt);
+ 	c->psrld(va, 16);
+ 	c->pmullw(va, vb);
+ 	c->pslld(va, 16);
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::MPYHH(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
+-	const XmmLink& vb = XmmGet(op.rb, XmmType::Int);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
++	const XmmLink& vb = XmmGet(op.rb, XmmType::Int, op.rt);
+ 	c->psrld(va, 16);
+ 	c->psrld(vb, 16);
+ 	c->pmaddwd(va, vb);
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::MPYS(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
+-	const XmmLink& vb = XmmGet(op.rb, XmmType::Int);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
++	const XmmLink& vb = XmmGet(op.rb, XmmType::Int, op.rt);
+ 	c->pmulhw(va, vb);
+ 	c->pslld(va, 16);
+ 	c->psrad(va, 16);
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::CEQH(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
+-	c->pcmpeqw(va, SPU_OFF_128(gpr, op.rb));
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
++	ps5_with_gpr(op.rb, [&](const auto& src) { c->pcmpeqw(va, src); });
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::FCMEQ(spu_opcode_t op)
+ {
+-	const XmmLink& vb = XmmGet(op.rb, XmmType::Float);
++	m_ps5_gpr_cache = true;
++	const XmmLink& vb = XmmGet(op.rb, XmmType::Float, op.rt);
+ 	const XmmLink& vi = XmmAlloc();
+ 	c->movaps(vi, XmmConst(v128::from32p(0x7fffffff)));
+ 	c->andps(vb, vi); // abs
+-	c->andps(vi, SPU_OFF_128(gpr, op.ra));
++	ps5_with_gpr(op.ra, [&](const auto& src) { c->andps(vi, src); });
+ 	c->cmpps(vb, vi, 0); // ==
+-	c->movaps(SPU_OFF_128(gpr, op.rt), vb);
++	gpr_store_ps(op.rt, vb);
+ }
+ 
+ void spu_recompiler::DFCMEQ(spu_opcode_t op)
+@@ -4019,8 +4694,9 @@ void spu_recompiler::DFCMEQ(spu_opcode_t op)
+ 
+ void spu_recompiler::MPYU(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
+-	const XmmLink& vb = XmmGet(op.rb, XmmType::Int);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
++	const XmmLink& vb = XmmGet(op.rb, XmmType::Int, op.rt);
+ 	const XmmLink& va2 = XmmAlloc();
+ 	c->movdqa(va2, va);
+ 	c->pmulhuw(va, vb);
+@@ -4028,21 +4704,23 @@ void spu_recompiler::MPYU(spu_opcode_t op)
+ 	c->pslld(va, 16);
+ 	c->pand(va2, XmmConst(v128::from32p(0xffff)));
+ 	c->por(va, va2);
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::CEQB(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
+-	c->pcmpeqb(va, SPU_OFF_128(gpr, op.rb));
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
++	ps5_with_gpr(op.rb, [&](const auto& src) { c->pcmpeqb(va, src); });
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::FI(spu_opcode_t op)
+ {
++	m_ps5_gpr_cache = true;
+ 	// Floating Interpolate
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Float);
+-	const XmmLink& vb = XmmGet(op.rb, XmmType::Float);
++	const XmmLink& va = XmmGet(op.ra, XmmType::Float, op.rt);
++	const XmmLink& vb = XmmGet(op.rb, XmmType::Float, op.rt);
+ 	const XmmLink& vb_base = XmmAlloc();
+ 	const XmmLink& ymul = XmmAlloc();
+ 	const XmmLink& temp_reg = XmmAlloc();
+@@ -4084,7 +4762,7 @@ void spu_recompiler::FI(spu_opcode_t op)
+ 	c->pand(ymul, XmmConst(v128::from32p(1 << 23)));
+ 	c->psubd(vb, ymul);
+ 
+-	c->movaps(SPU_OFF_128(gpr, op.rt), vb);
++	gpr_store_ps(op.rt, vb);
+ }
+ 
+ void spu_recompiler::HEQ(spu_opcode_t op)
+@@ -4110,19 +4788,21 @@ void spu_recompiler::HEQ(spu_opcode_t op)
+ 
+ void spu_recompiler::CFLTS(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Float);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Float, op.rt);
+ 	const XmmLink& vi = XmmAlloc();
+ 	if (op.i8 != 173) c->mulps(va, XmmConst(v128::fromf32p(std::exp2(static_cast<float>(static_cast<s16>(173 - op.i8)))))); // scale
+ 	c->movaps(vi, XmmConst(v128::fromf32p(std::exp2(31.f))));
+ 	c->cmpps(vi, va, 2);
+ 	c->cvttps2dq(va, va); // convert to ints with truncation
+ 	c->pxor(va, vi); // fix result saturation (0x80000000 -> 0x7fffffff)
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::CFLTU(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Float);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Float, op.rt);
+ 	const XmmLink& vs = XmmAlloc();
+ 	const XmmLink& vs2 = XmmAlloc();
+ 	const XmmLink& vs3 = XmmAlloc();
+@@ -4133,7 +4813,7 @@ void spu_recompiler::CFLTU(spu_opcode_t op)
+ 		c->vcvttps2udq(vs, va);
+ 		c->psrad(va, 31);
+ 		c->pandn(va, vs);
+-		c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++		gpr_store(op.rt, va);
+ 		return;
+ 	}
+ 
+@@ -4151,20 +4831,22 @@ void spu_recompiler::CFLTU(spu_opcode_t op)
+ 	c->cvttps2dq(vs2, vs2);
+ 	c->por(va, vs);
+ 	c->por(va, vs2);
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::CSFLT(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
+ 	c->cvtdq2ps(va, va); // convert to floats
+ 	if (op.i8 != 155) c->mulps(va, XmmConst(v128::fromf32p(std::exp2(static_cast<float>(static_cast<s16>(op.i8 - 155)))))); // scale
+-	c->movaps(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store_ps(op.rt, va);
+ }
+ 
+ void spu_recompiler::CUFLT(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
+ 	const XmmLink& v1 = XmmAlloc();
+ 
+ 	if (utils::has_avx512())
+@@ -4182,13 +4864,16 @@ void spu_recompiler::CUFLT(spu_opcode_t op)
+ 	}
+ 
+ 	if (op.i8 != 155) c->mulps(va, XmmConst(v128::fromf32p(std::exp2(static_cast<float>(static_cast<s16>(op.i8 - 155)))))); // scale
+-	c->movaps(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store_ps(op.rt, va);
+ }
+ 
+ void spu_recompiler::BRZ(spu_opcode_t op)
+ {
+ 	const u32 target = spu_branch_target(m_pos, op.i16);
+ 
++	// The compare does not modify xmm. Keep the map for the fallthrough.
++	m_ps5_gpr_cache = true;
++
+ 	if (target == m_pos + 4)
+ 	{
+ 		return;
+@@ -4198,8 +4883,23 @@ void spu_recompiler::BRZ(spu_opcode_t op)
+ 	c->cmp(SPU_OFF_32(gpr, op.rt, &v128::_u32, 3), 0);
+ 	c->je(branch_label);
+ 
++	std::array<s8, 16> owners{};
++
++	for (u32 slot = 0; slot < 16; slot++)
++	{
++		owners[slot] = m_xmm_owner[slot];
++	}
++
+ 	after.emplace_back([=, this]()
+ 	{
++		for (u32 slot = 0; slot < 16; slot++)
++		{
++			m_xmm_owner[slot] = owners[slot];
++			// Memory was flushed before the compare. Do not store the
++			// end-of-function dirty set into this branch.
++			m_xmm_dirty[slot] = 0;
++		}
++
+ 		c->align(asmjit::AlignMode::kCode, 16);
+ 		c->bind(branch_label);
+ 		branch_fixed(target);
+@@ -4210,6 +4910,7 @@ void spu_recompiler::STQA(spu_opcode_t op)
+ {
+ 	if (utils::has_ssse3())
+ 	{
++		m_ps5_gpr_cache = true;
+ 		const XmmLink& vt = XmmGet(op.rt, XmmType::Int);
+ 		c->pshufb(vt, XmmConst(v128::from32r(0x00010203, 0x04050607, 0x08090a0b, 0x0c0d0e0f)));
+ 		c->movdqa(asmjit::x86::oword_ptr(*ls, spu_ls_target(0, op.i16)), vt);
+@@ -4229,6 +4930,8 @@ void spu_recompiler::BRNZ(spu_opcode_t op)
+ {
+ 	const u32 target = spu_branch_target(m_pos, op.i16);
+ 
++	m_ps5_gpr_cache = true;
++
+ 	if (target == m_pos + 4)
+ 	{
+ 		return;
+@@ -4238,8 +4941,23 @@ void spu_recompiler::BRNZ(spu_opcode_t op)
+ 	c->cmp(SPU_OFF_32(gpr, op.rt, &v128::_u32, 3), 0);
+ 	c->jne(branch_label);
+ 
++	std::array<s8, 16> owners{};
++
++	for (u32 slot = 0; slot < 16; slot++)
++	{
++		owners[slot] = m_xmm_owner[slot];
++	}
++
+ 	after.emplace_back([=, this]()
+ 	{
++		for (u32 slot = 0; slot < 16; slot++)
++		{
++			m_xmm_owner[slot] = owners[slot];
++			// Memory was flushed before the compare. Do not store the
++			// end-of-function dirty set into this branch.
++			m_xmm_dirty[slot] = 0;
++		}
++
+ 		c->align(asmjit::AlignMode::kCode, 16);
+ 		c->bind(branch_label);
+ 		branch_fixed(target);
+@@ -4250,6 +4968,8 @@ void spu_recompiler::BRHZ(spu_opcode_t op)
+ {
+ 	const u32 target = spu_branch_target(m_pos, op.i16);
+ 
++	m_ps5_gpr_cache = true;
++
+ 	if (target == m_pos + 4)
+ 	{
+ 		return;
+@@ -4259,8 +4979,23 @@ void spu_recompiler::BRHZ(spu_opcode_t op)
+ 	c->cmp(SPU_OFF_16(gpr, op.rt, &v128::_u16, 6), 0);
+ 	c->je(branch_label);
+ 
++	std::array<s8, 16> owners{};
++
++	for (u32 slot = 0; slot < 16; slot++)
++	{
++		owners[slot] = m_xmm_owner[slot];
++	}
++
+ 	after.emplace_back([=, this]()
+ 	{
++		for (u32 slot = 0; slot < 16; slot++)
++		{
++			m_xmm_owner[slot] = owners[slot];
++			// Memory was flushed before the compare. Do not store the
++			// end-of-function dirty set into this branch.
++			m_xmm_dirty[slot] = 0;
++		}
++
+ 		c->align(asmjit::AlignMode::kCode, 16);
+ 		c->bind(branch_label);
+ 		branch_fixed(target);
+@@ -4271,6 +5006,8 @@ void spu_recompiler::BRHNZ(spu_opcode_t op)
+ {
+ 	const u32 target = spu_branch_target(m_pos, op.i16);
+ 
++	m_ps5_gpr_cache = true;
++
+ 	if (target == m_pos + 4)
+ 	{
+ 		return;
+@@ -4280,8 +5017,23 @@ void spu_recompiler::BRHNZ(spu_opcode_t op)
+ 	c->cmp(SPU_OFF_16(gpr, op.rt, &v128::_u16, 6), 0);
+ 	c->jne(branch_label);
+ 
++	std::array<s8, 16> owners{};
++
++	for (u32 slot = 0; slot < 16; slot++)
++	{
++		owners[slot] = m_xmm_owner[slot];
++	}
++
+ 	after.emplace_back([=, this]()
+ 	{
++		for (u32 slot = 0; slot < 16; slot++)
++		{
++			m_xmm_owner[slot] = owners[slot];
++			// Memory was flushed before the compare. Do not store the
++			// end-of-function dirty set into this branch.
++			m_xmm_dirty[slot] = 0;
++		}
++
+ 		c->align(asmjit::AlignMode::kCode, 16);
+ 		c->bind(branch_label);
+ 		branch_fixed(target);
+@@ -4295,6 +5047,7 @@ void spu_recompiler::STQR(spu_opcode_t op)
+ 
+ 	if (utils::has_ssse3())
+ 	{
++		m_ps5_gpr_cache = true;
+ 		const XmmLink& vt = XmmGet(op.rt, XmmType::Int);
+ 		c->pshufb(vt, XmmConst(v128::from32r(0x00010203, 0x04050607, 0x08090a0b, 0x0c0d0e0f)));
+ 		c->movdqa(asmjit::x86::oword_ptr(*ls, addr->r64()), vt);
+@@ -4322,10 +5075,11 @@ void spu_recompiler::LQA(spu_opcode_t op)
+ {
+ 	if (utils::has_ssse3())
+ 	{
++		m_ps5_gpr_cache = true;
+ 		const XmmLink& vt = XmmAlloc();
+ 		c->movdqa(vt, asmjit::x86::oword_ptr(*ls, spu_ls_target(0, op.i16)));
+ 		c->pshufb(vt, XmmConst(v128::from32r(0x00010203, 0x04050607, 0x08090a0b, 0x0c0d0e0f)));
+-		c->movdqa(SPU_OFF_128(gpr, op.rt), vt);
++		gpr_store(op.rt, vt);
+ 	}
+ 	else
+ 	{
+@@ -4367,13 +5121,14 @@ void spu_recompiler::BR(spu_opcode_t op)
+ 
+ void spu_recompiler::FSMBI(spu_opcode_t op)
+ {
++	m_ps5_gpr_cache = true;
+ 	v128 data;
+ 	for (u32 i = 0; i < 16; i++)
+ 		data._u8[i] = op.i16 & (1u << i) ? 0xff : 0;
+ 
+ 	const XmmLink& vr = XmmAlloc();
+ 	c->movdqa(vr, XmmConst(data));
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), vr);
++	gpr_store(op.rt, vr);
+ }
+ 
+ void spu_recompiler::BRSL(spu_opcode_t op)
+@@ -4402,10 +5157,11 @@ void spu_recompiler::LQR(spu_opcode_t op)
+ 
+ 	if (utils::has_ssse3())
+ 	{
++		m_ps5_gpr_cache = true;
+ 		const XmmLink& vt = XmmAlloc();
+ 		c->movdqa(vt, asmjit::x86::oword_ptr(*ls, addr->r64()));
+ 		c->pshufb(vt, XmmConst(v128::from32r(0x00010203, 0x04050607, 0x08090a0b, 0x0c0d0e0f)));
+-		c->movdqa(SPU_OFF_128(gpr, op.rt), vt);
++		gpr_store(op.rt, vt);
+ 	}
+ 	else
+ 	{
+@@ -4420,104 +5176,135 @@ void spu_recompiler::LQR(spu_opcode_t op)
+ 
+ void spu_recompiler::IL(spu_opcode_t op)
+ {
++	m_ps5_gpr_cache = true;
+ 	const XmmLink& vr = XmmAlloc();
+ 	c->movdqa(vr, XmmConst(v128::from32p(op.si16)));
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), vr);
++	gpr_store(op.rt, vr);
+ }
+ 
+ void spu_recompiler::ILHU(spu_opcode_t op)
+ {
++	m_ps5_gpr_cache = true;
+ 	const XmmLink& vr = XmmAlloc();
+ 	c->movdqa(vr, XmmConst(v128::from32p(op.i16 << 16)));
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), vr);
++	gpr_store(op.rt, vr);
+ }
+ 
+ void spu_recompiler::ILH(spu_opcode_t op)
+ {
++	m_ps5_gpr_cache = true;
+ 	const XmmLink& vr = XmmAlloc();
+ 	c->movdqa(vr, XmmConst(v128::from16p(op.i16)));
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), vr);
++	gpr_store(op.rt, vr);
+ }
+ 
+ void spu_recompiler::IOHL(spu_opcode_t op)
+ {
+-	const XmmLink& vt = XmmGet(op.rt, XmmType::Int);
++	m_ps5_gpr_cache = true;
++	const XmmLink& vt = XmmGet(op.rt, XmmType::Int, op.rt);
+ 	c->por(vt, XmmConst(v128::from32p(op.i16)));
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), vt);
++	gpr_store(op.rt, vt);
+ }
+ 
+ void spu_recompiler::ORI(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
+ 	if (op.si10) c->por(va, XmmConst(v128::from32p(op.si10)));
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::ORHI(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
+ 	c->por(va, XmmConst(v128::from16p(op.si10)));
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::ORBI(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
+ 	c->por(va, XmmConst(v128::from8p(op.si10)));
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::SFI(spu_opcode_t op)
+ {
++	m_ps5_gpr_cache = true;
+ 	const XmmLink& vr = XmmAlloc();
+ 	c->movdqa(vr, XmmConst(v128::from32p(op.si10)));
+-	c->psubd(vr, SPU_OFF_128(gpr, op.ra));
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), vr);
++	ps5_with_gpr(op.ra, [&](const auto& src) { c->psubd(vr, src); });
++	gpr_store(op.rt, vr);
+ }
+ 
+ void spu_recompiler::SFHI(spu_opcode_t op)
+ {
++	m_ps5_gpr_cache = true;
+ 	const XmmLink& vr = XmmAlloc();
+ 	c->movdqa(vr, XmmConst(v128::from16p(op.si10)));
+-	c->psubw(vr, SPU_OFF_128(gpr, op.ra));
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), vr);
++	ps5_with_gpr(op.ra, [&](const auto& src) { c->psubw(vr, src); });
++	gpr_store(op.rt, vr);
+ }
+ 
+ void spu_recompiler::ANDI(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
+ 	c->pand(va, XmmConst(v128::from32p(op.si10)));
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::ANDHI(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
+ 	c->pand(va, XmmConst(v128::from16p(op.si10)));
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::ANDBI(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
+ 	c->pand(va, XmmConst(v128::from8p(op.si10)));
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::AI(spu_opcode_t op)
+ {
+-	// add
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
++	m_ps5_gpr_cache = true;
++
++	if (utils::has_avx())
++	{
++		const auto* xa = ps5_gpr_xmm(op.ra);
++		const XmmLink& vd = XmmAlloc();
++
++		if (xa)
++			c->vpaddd(vd, *xa, XmmConst(v128::from32p(op.si10)));
++		else
++		{
++			c->vmovdqa(vd, SPU_OFF_128(gpr, op.ra));
++			c->paddd(vd, XmmConst(v128::from32p(op.si10)));
++		}
++
++		gpr_store(op.rt, vd);
++		return;
++	}
++
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
+ 	c->paddd(va, XmmConst(v128::from32p(op.si10)));
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::AHI(spu_opcode_t op)
+ {
++	m_ps5_gpr_cache = true;
+ 	// add
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
+ 	c->paddw(va, XmmConst(v128::from16p(op.si10)));
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::STQD(spu_opcode_t op)
+@@ -4528,6 +5315,7 @@ void spu_recompiler::STQD(spu_opcode_t op)
+ 
+ 	if (utils::has_ssse3())
+ 	{
++		m_ps5_gpr_cache = true;
+ 		const XmmLink& vt = XmmGet(op.rt, XmmType::Int);
+ 		c->pshufb(vt, XmmConst(v128::from32r(0x00010203, 0x04050607, 0x08090a0b, 0x0c0d0e0f)));
+ 		c->movdqa(asmjit::x86::oword_ptr(*ls, addr->r64()), vt);
+@@ -4551,10 +5339,11 @@ void spu_recompiler::LQD(spu_opcode_t op)
+ 
+ 	if (utils::has_ssse3())
+ 	{
++		m_ps5_gpr_cache = true;
+ 		const XmmLink& vt = XmmAlloc();
+ 		c->movdqa(vt, asmjit::x86::oword_ptr(*ls, addr->r64()));
+ 		c->pshufb(vt, XmmConst(v128::from32r(0x00010203, 0x04050607, 0x08090a0b, 0x0c0d0e0f)));
+-		c->movdqa(SPU_OFF_128(gpr, op.rt), vt);
++		gpr_store(op.rt, vt);
+ 	}
+ 	else
+ 	{
+@@ -4569,44 +5358,50 @@ void spu_recompiler::LQD(spu_opcode_t op)
+ 
+ void spu_recompiler::XORI(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
+ 	c->pxor(va, XmmConst(v128::from32p(op.si10)));
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::XORHI(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
+ 	c->pxor(va, XmmConst(v128::from16p(op.si10)));
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::XORBI(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
+ 	c->pxor(va, XmmConst(v128::from8p(op.si10)));
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::CGTI(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
+ 	c->pcmpgtd(va, XmmConst(v128::from32p(op.si10)));
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::CGTHI(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
+ 	c->pcmpgtw(va, XmmConst(v128::from16p(op.si10)));
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::CGTBI(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
+ 	c->pcmpgtb(va, XmmConst(v128::from8p(op.si10)));
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::HGTI(spu_opcode_t op)
+@@ -4631,26 +5426,29 @@ void spu_recompiler::HGTI(spu_opcode_t op)
+ 
+ void spu_recompiler::CLGTI(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
+ 	c->pxor(va, XmmConst(v128::from32p(0x80000000)));
+ 	c->pcmpgtd(va, XmmConst(v128::from32p(op.si10 - 0x80000000)));
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::CLGTHI(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
+ 	c->pxor(va, XmmConst(v128::from16p(0x8000)));
+ 	c->pcmpgtw(va, XmmConst(v128::from16p(op.si10 - 0x8000)));
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::CLGTBI(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
+ 	c->psubb(va, XmmConst(v128::from8p(0x80)));
+ 	c->pcmpgtb(va, XmmConst(v128::from8p(op.si10 - 0x80)));
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::HLGTI(spu_opcode_t op)
+@@ -4675,14 +5473,16 @@ void spu_recompiler::HLGTI(spu_opcode_t op)
+ 
+ void spu_recompiler::MPYI(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
+ 	c->pmaddwd(va, XmmConst(v128::from32p(op.si10 & 0xffff)));
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::MPYUI(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
+ 	const XmmLink& vi = XmmAlloc();
+ 	const XmmLink& va2 = XmmAlloc();
+ 	c->movdqa(va2, va);
+@@ -4691,28 +5491,49 @@ void spu_recompiler::MPYUI(spu_opcode_t op)
+ 	c->pmullw(va2, vi);
+ 	c->pslld(va, 16);
+ 	c->por(va, va2);
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::CEQI(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
++	m_ps5_gpr_cache = true;
++
++	if (utils::has_avx())
++	{
++		const auto* xa = ps5_gpr_xmm(op.ra);
++		const XmmLink& vd = XmmAlloc();
++
++		if (xa)
++			c->vpcmpeqd(vd, *xa, XmmConst(v128::from32p(op.si10)));
++		else
++		{
++			c->vmovdqa(vd, SPU_OFF_128(gpr, op.ra));
++			c->pcmpeqd(vd, XmmConst(v128::from32p(op.si10)));
++		}
++
++		gpr_store(op.rt, vd);
++		return;
++	}
++
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
+ 	c->pcmpeqd(va, XmmConst(v128::from32p(op.si10)));
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::CEQHI(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
+ 	c->pcmpeqw(va, XmmConst(v128::from16p(op.si10)));
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::CEQBI(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt);
+ 	c->pcmpeqb(va, XmmConst(v128::from8p(op.si10)));
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), va);
++	gpr_store(op.rt, va);
+ }
+ 
+ void spu_recompiler::HEQI(spu_opcode_t op)
+@@ -4745,44 +5566,47 @@ void spu_recompiler::HBRR([[maybe_unused]] spu_opcode_t op)
+ 
+ void spu_recompiler::ILA(spu_opcode_t op)
+ {
++	m_ps5_gpr_cache = true;
+ 	const XmmLink& vr = XmmAlloc();
+ 	c->movdqa(vr, XmmConst(v128::from32p(op.i18)));
+-	c->movdqa(SPU_OFF_128(gpr, op.rt), vr);
++	gpr_store(op.rt, vr);
+ }
+ 
+ void spu_recompiler::SELB(spu_opcode_t op)
+ {
+-	const XmmLink& vb = XmmGet(op.rb, XmmType::Int);
+-	const XmmLink& vc = XmmGet(op.rc, XmmType::Int);
++	m_ps5_gpr_cache = true;
++	const XmmLink& vb = XmmGet(op.rb, XmmType::Int, op.rt4);
++	const XmmLink& vc = XmmGet(op.rc, XmmType::Int, op.rt4);
+ 
+ 	if (utils::has_avx512())
+ 	{
+-		c->vpternlogd(vc, vb, SPU_OFF_128(gpr, op.ra), 0xca /* A?B:C */);
+-		c->movdqa(SPU_OFF_128(gpr, op.rt4), vc);
++		ps5_with_gpr(op.ra, [&](const auto& src) { c->vpternlogd(vc, vb, src, 0xca /* A?B:C */); });
++		gpr_store(op.rt4, vc);
+ 		return;
+ 	}
+ 
+ 	if (utils::has_xop())
+ 	{
+-		c->vpcmov(vc, vb, SPU_OFF_128(gpr, op.ra), vc);
+-		c->movdqa(SPU_OFF_128(gpr, op.rt4), vc);
++		ps5_with_gpr(op.ra, [&](const auto& src) { c->vpcmov(vc, vb, src, vc); });
++		gpr_store(op.rt4, vc);
+ 		return;
+ 	}
+ 
+ 	c->pand(vb, vc);
+-	c->pandn(vc, SPU_OFF_128(gpr, op.ra));
++	ps5_with_gpr(op.ra, [&](const auto& src) { c->pandn(vc, src); });
+ 	c->por(vb, vc);
+-	c->movdqa(SPU_OFF_128(gpr, op.rt4), vb);
++	gpr_store(op.rt4, vb);
+ }
+ 
+ void spu_recompiler::SHUFB(spu_opcode_t op)
+ {
++	m_ps5_gpr_cache = true;
+ 	if (0 && utils::has_avx512())
+ 	{
+ 		// Deactivated due to poor performance of mask merge ops.
+-		const XmmLink& va = XmmGet(op.ra, XmmType::Int);
+-		const XmmLink& vb = XmmGet(op.rb, XmmType::Int);
+-		const XmmLink& vc = XmmGet(op.rc, XmmType::Int);
++		const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt4);
++		const XmmLink& vb = XmmGet(op.rb, XmmType::Int, op.rt4);
++		const XmmLink& vc = XmmGet(op.rc, XmmType::Int, op.rt4);
+ 		const XmmLink& vt = XmmAlloc();
+ 		const XmmLink& vm = XmmAlloc();
+ 		c->vpcmpub(asmjit::x86::k1, vc, XmmConst(v128::from8p(-0x40)), 5 /* GE */);
+@@ -4797,7 +5621,7 @@ void spu_recompiler::SHUFB(spu_opcode_t op)
+ 		c->setExtraReg(asmjit::x86::k1);
+ 		c->vpshufb(vt, vb, vm); // {k1}
+ 		c->vpternlogd(vt, va, vc, 0xf6 /* orAxorBC */);
+-		c->movdqa(SPU_OFF_128(gpr, op.rt4), vt);
++		gpr_store(op.rt4, vt);
+ 		return;
+ 	}
+ 
+@@ -4806,9 +5630,9 @@ void spu_recompiler::SHUFB(spu_opcode_t op)
+ 		return fall(op);
+ 	}
+ 
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
+-	const XmmLink& vb = XmmGet(op.rb, XmmType::Int);
+-	const XmmLink& vc = XmmGet(op.rc, XmmType::Int);
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt4);
++	const XmmLink& vb = XmmGet(op.rb, XmmType::Int, op.rt4);
++	const XmmLink& vc = XmmGet(op.rc, XmmType::Int, op.rt4);
+ 	const XmmLink& vt = XmmAlloc();
+ 	const XmmLink& vm = XmmAlloc();
+ 	const XmmLink& v5 = XmmAlloc();
+@@ -4849,26 +5673,28 @@ void spu_recompiler::SHUFB(spu_opcode_t op)
+ 		c->por(vt, vc);
+ 	}
+ 
+-	c->movdqa(SPU_OFF_128(gpr, op.rt4), vt);
++	gpr_store(op.rt4, vt);
+ }
+ 
+ void spu_recompiler::MPYA(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Int);
+-	const XmmLink& vb = XmmGet(op.rb, XmmType::Int);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Int, op.rt4);
++	const XmmLink& vb = XmmGet(op.rb, XmmType::Int, op.rt4);
+ 	const XmmLink& vi = XmmAlloc();
+ 	c->movdqa(vi, XmmConst(v128::from32p(0xffff)));
+ 	c->pand(va, vi);
+ 	c->pand(vb, vi);
+ 	c->pmaddwd(va, vb);
+-	c->paddd(va, SPU_OFF_128(gpr, op.rc));
+-	c->movdqa(SPU_OFF_128(gpr, op.rt4), va);
++	ps5_with_gpr(op.rc, [&](const auto& src) { c->paddd(va, src); });
++	gpr_store(op.rt4, va);
+ }
+ 
+ void spu_recompiler::FNMS(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Float);
+-	const XmmLink& vb = XmmGet(op.rb, XmmType::Float);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Float, op.rt4);
++	const XmmLink& vb = XmmGet(op.rb, XmmType::Float, op.rt4);
+ 	const XmmLink& mask = XmmAlloc();
+ 	const XmmLink& v1 = XmmAlloc();
+ 	const XmmLink& v2 = XmmAlloc();
+@@ -4883,15 +5709,16 @@ void spu_recompiler::FNMS(spu_opcode_t op)
+ 	c->andps(vb, v2); // vb = rb & ~rb_extended
+ 
+ 	c->mulps(va, vb);
+-	c->movaps(vb, SPU_OFF_128(gpr, op.rc));
++	ps5_with_gpr(op.rc, [&](const auto& src) { c->movaps(vb, src); });
+ 	c->subps(vb, va);
+-	c->movaps(SPU_OFF_128(gpr, op.rt4), vb);
++	gpr_store_ps(op.rt4, vb);
+ }
+ 
+ void spu_recompiler::FMA(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Float);
+-	const XmmLink& vb = XmmGet(op.rb, XmmType::Float);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Float, op.rt4);
++	const XmmLink& vb = XmmGet(op.rb, XmmType::Float, op.rt4);
+ 	const XmmLink& mask = XmmAlloc();
+ 	const XmmLink& v1 = XmmAlloc();
+ 	const XmmLink& v2 = XmmAlloc();
+@@ -4906,14 +5733,15 @@ void spu_recompiler::FMA(spu_opcode_t op)
+ 	c->andps(vb, v2); // vb = rb & ~rb_extended
+ 
+ 	c->mulps(va, vb);
+-	c->addps(va, SPU_OFF_128(gpr, op.rc));
+-	c->movaps(SPU_OFF_128(gpr, op.rt4), va);
++	ps5_with_gpr(op.rc, [&](const auto& src) { c->addps(va, src); });
++	gpr_store_ps(op.rt4, va);
+ }
+ 
+ void spu_recompiler::FMS(spu_opcode_t op)
+ {
+-	const XmmLink& va = XmmGet(op.ra, XmmType::Float);
+-	const XmmLink& vb = XmmGet(op.rb, XmmType::Float);
++	m_ps5_gpr_cache = true;
++	const XmmLink& va = XmmGet(op.ra, XmmType::Float, op.rt4);
++	const XmmLink& vb = XmmGet(op.rb, XmmType::Float, op.rt4);
+ 	const XmmLink& mask = XmmAlloc();
+ 	const XmmLink& v1 = XmmAlloc();
+ 	const XmmLink& v2 = XmmAlloc();
+@@ -4928,6 +5756,6 @@ void spu_recompiler::FMS(spu_opcode_t op)
+ 	c->andps(vb, v2); // vb = rb & ~rb_extended
+ 
+ 	c->mulps(va, vb);
+-	c->subps(va, SPU_OFF_128(gpr, op.rc));
+-	c->movaps(SPU_OFF_128(gpr, op.rt4), va);
++	ps5_with_gpr(op.rc, [&](const auto& src) { c->subps(va, src); });
++	gpr_store_ps(op.rt4, va);
+ }
+diff --git a/rpcs3/Emu/Cell/SPUASMJITRecompiler.h b/rpcs3/Emu/Cell/SPUASMJITRecompiler.h
+index 36c238f23..cb6540a3f 100644
+--- a/rpcs3/Emu/Cell/SPUASMJITRecompiler.h
++++ b/rpcs3/Emu/Cell/SPUASMJITRecompiler.h
+@@ -3,7 +3,9 @@
+ #include "Utilities/JIT.h"
+ #include "SPURecompiler.h"
+ 
++#include <array>
+ #include <functional>
++#include <unordered_map>
+ 
+ union v128;
+ 
+@@ -42,6 +44,23 @@ private:
+ 	const asmjit::x86::Gp* addr;
+ 	std::array<const asmjit::x86::Xmm*, 16> vec;
+ 
++	// Values kept in xmm across straight-line ALU. -1 means the slot does not
++	// match a GPR. Dirty slots are written back only when memory is read,
++	// a slot is reused, or the block exits.
++	bool m_ps5_gpr_cache = false;
++	bool m_ps5_fallthrough = false;
++	s8 m_xmm_owner[16]{};
++	u8 m_xmm_dirty[16]{};
++	u8 m_xmm_taken[16]{};
++	const asmjit::x86::Xmm* m_xmm_reg[16]{};
++	const u32* m_ps5_words = nullptr;
++	u32 m_ps5_start = 0;
++	u32 m_ps5_count = 0;
++	// Loop headers reached only by fallthrough plus backward branches. The hot
++	// path keeps these xmm owners; every other entry reloads them from memory.
++	std::unordered_map<u32, std::array<s8, 16>> m_ps5_entry;
++	std::unordered_map<u32, asmjit::Label> m_ps5_cold;
++
+ 	// workload for the end of function:
+ 	std::vector<std::function<void()>> after;
+ 	std::vector<std::function<void()>> consts;
+@@ -85,7 +104,24 @@ private:
+ 	};
+ 
+ 	XmmLink XmmAlloc();
+-	XmmLink XmmGet(s8 reg, XmmType type);
++	// dest == reg, or a source that dies before the next label, stays in place.
++	// A source that is still live is copied so the next use does not reload it.
++	XmmLink XmmGet(s8 reg, XmmType type, s8 dest = -1);
++	void gpr_store(s8 rt, const XmmLink& v);
++	void gpr_store_ps(s8 rt, const XmmLink& v);
++	void gpr_store_pd(s8 rt, const XmmLink& v);
++	bool ps5_note_store(s8 rt, const XmmLink& v);
++	void ps5_flush_dirty();
++	void ps5_drop_gpr_cache();
++	bool ps5_inherit_label(u32 pos) const;
++	bool ps5_defer_store(u32 opcode) const;
++	u32 ps5_src_count(s8 reg) const;
++	bool ps5_src_dead(s8 reg) const;
++	// Read-only view of a GPR that is already in an xmm. Does not claim the slot,
++	// so a later instruction can still reuse it. Null when the value is only in memory.
++	const asmjit::x86::Xmm* ps5_gpr_xmm(s8 reg) const;
++	template <typename Emit>
++	void ps5_with_gpr(s8 src, Emit emit);
+ 
+ 	asmjit::x86::Mem XmmConst(const v128& data);
+ 
+diff --git a/rpcs3/Emu/Cell/SPUCommonRecompiler.cpp b/rpcs3/Emu/Cell/SPUCommonRecompiler.cpp
+index e694d44e7..e1c4fe8ac 100644
+--- a/rpcs3/Emu/Cell/SPUCommonRecompiler.cpp
++++ b/rpcs3/Emu/Cell/SPUCommonRecompiler.cpp
+@@ -1,6 +1,12 @@
+ #include "stdafx.h"
+ #include "SPURecompiler.h"
+ 
++#ifdef __PROSPERO__
++#include <condition_variable>
++#include <mutex>
++#include <thread>
++#endif
++
+ #include "Emu/System.h"
+ #include "Emu/system_config.h"
+ #include "Emu/system_progress.hpp"
+@@ -28,6 +34,7 @@
+ #include "util/v128.hpp"
+ #include "util/simd.hpp"
+ #include "util/sysinfo.hpp"
++#include <setjmp.h>
+ 
+ const extern spu_decoder<spu_itype> g_spu_itype;
+ const extern spu_decoder<spu_iname> g_spu_iname;
+@@ -170,6 +177,46 @@ static spu_function_t compile_spu_llvm_with_retry(std::unique_ptr<spu_recompiler
+ }
+ #endif
+ 
++static thread_local bool g_spu_compile_faulted = false;
++
++#ifdef __PROSPERO__
++static thread_local bool g_ps5_compiling_spurs = false;
++
++bool spu_ps5_compiling_spurs() noexcept
++{
++	return g_ps5_compiling_spurs;
++}
++
++void spu_ps5_set_compiling_spurs(bool on) noexcept
++{
++	g_ps5_compiling_spurs = on;
++}
++#endif
++
++// LLVM codegen on this port can fault inside MachineInstr::hasOrderedMemoryRef.
++// Catch it and let the caller run the interpreter instead of killing the SPU thread.
++static spu_function_t compile_catching_host_fault(spu_recompiler_base& compiler, spu_program&& program)
++{
++	g_spu_compile_faulted = false;
++	sigjmp_buf jump;
++	thread_ctrl::set_host_fault_jmp(&jump);
++
++	if (sigsetjmp(jump, 1) != 0)
++	{
++		thread_ctrl::set_host_fault_jmp(nullptr);
++		g_spu_compile_faulted = true;
++#ifdef __PROSPERO__
++		spu_ps5_set_compiling_spurs(false);
++#endif
++		spu_log.error("SPU LLVM compile crashed; leaving this block on the interpreter");
++		return {};
++	}
++
++	spu_function_t fn = compiler.compile(std::move(program));
++	thread_ctrl::set_host_fault_jmp(nullptr);
++	return fn;
++}
++
+ // Move 4 args for calling native function from a GHC calling convention function
+ #if defined(ARCH_X64)
+ static u8* move_args_ghc_to_native(u8* raw)
+@@ -296,12 +343,34 @@ DECLARE(spu_runtime::g_dispatcher) = []
+ 	return ptr;
+ }();
+ 
++#ifdef __PROSPERO__
++DECLARE(spu_runtime::g_dispatcher_spurs) = []
++{
++	jit_write_guard jit_guard;
++
++	const auto ptr = reinterpret_cast<std::remove_const_t<decltype(spu_runtime::g_dispatcher_spurs)>>(jit_runtime::alloc(sizeof(*g_dispatcher_spurs), 64, false));
++
++	for (auto& x : *ptr)
++	{
++		x.raw() = tr_dispatch;
++	}
++
++	return ptr;
++}();
++#endif
++
+ DECLARE(spu_runtime::tr_all) = []
+ {
+ 	jit_write_guard jit_guard;
+ 
+ #if defined(ARCH_X64)
+-	u8* const trptr = jit_runtime::alloc(32, 16);
++	u8* const trptr = jit_runtime::alloc(
++#ifdef __PROSPERO__
++		64
++#else
++		32
++#endif
++		, 16);
+ 	u8* raw = trptr;
+ 
+ 	// Load PC: mov eax, [r13 + spu_thread::pc]
+@@ -326,6 +395,42 @@ DECLARE(spu_runtime::tr_all) = []
+ 	*raw++ = 0xe8;
+ 	*raw++ = 0x0c;
+ 
++#ifdef __PROSPERO__
++	// cmp byte [r13 + ps5_spurs], 0
++	*raw++ = 0x41;
++	*raw++ = 0x80;
++	*raw++ = 0xbd;
++	{
++		const s32 spurs_off = ::narrow<s32>(::offset32(&spu_thread::ps5_spurs));
++		std::memcpy(raw, &spurs_off, 4);
++		raw += 4;
++	}
++	*raw++ = 0x00;
++
++	// je use_main
++	*raw++ = 0x74;
++	u8* const je_rel = raw;
++	*raw++ = 0x00;
++
++	// lea rdx, [rip + g_dispatcher_spurs]
++	*raw++ = 0x48;
++	*raw++ = 0x8d;
++	*raw++ = 0x15;
++	{
++		const s32 disp = ::narrow<s32>(reinterpret_cast<u64>(g_dispatcher_spurs) - reinterpret_cast<u64>(raw) - 4);
++		std::memcpy(raw, &disp, 4);
++		raw += 4;
++	}
++
++	// jmp common
++	*raw++ = 0xeb;
++	u8* const jmp_rel = raw;
++	*raw++ = 0x00;
++
++	// use_main:
++	*je_rel = ::narrow<u8>(raw - (je_rel + 1));
++#endif
++
+ 	// Load g_dispatcher to rdx
+ 	*raw++ = 0x48;
+ 	*raw++ = 0x8d;
+@@ -334,6 +439,11 @@ DECLARE(spu_runtime::tr_all) = []
+ 	std::memcpy(raw, &r32, 4);
+ 	raw += 4;
+ 
++#ifdef __PROSPERO__
++	// common:
++	*jmp_rel = ::narrow<u8>(raw - (jmp_rel + 1));
++#endif
++
+ 	// Update block_hash (set zero): mov [r13 + spu_thread::m_block_hash], 0
+ 	*raw++ = 0x49;
+ 	*raw++ = 0xc7;
+@@ -1006,12 +1116,37 @@ void spu_cache::initialize(bool build_existing_cache)
+ 
+ 		compiler->init();
+ 
++		bool compile_fault = false;
++
++		// One host fault abandons this worker's compiler. Later modules stay on the
++		// interpreter. Touching the compiler or the fake LS again can fault a second
++		// time, and that fault kills the worker while the cache dialog is still waiting.
++		bool compiler_dead = false;
++
+ 		auto compile_program = [&](spu_program&& program) -> spu_function_t
+ 		{
++			compile_fault = false;
+ #ifdef ARCH_ARM64
+ 			return compile_spu_llvm_with_retry(compiler, program);
+ #else
+-			return compiler->compile(std::move(program));
++			if (!compiler)
++			{
++				compile_fault = true;
++				return {};
++			}
++
++			spu_function_t fn = compile_catching_host_fault(*compiler, std::move(program));
++			compile_fault = g_spu_compile_faulted;
++
++			if (compile_fault)
++			{
++				// Leave the broken compiler behind. Rebuilding it here takes the LLVM lock
++				// the crashed compile still holds, and the cache dialog waits on this worker.
++				compiler.release();
++				compiler_dead = true;
++			}
++
++			return fn;
+ #endif
+ 		};
+ 
+@@ -1034,7 +1169,7 @@ void spu_cache::initialize(bool build_existing_cache)
+ 		{
+ 			const spu_program& func = std::as_const(func_list)[func_i];
+ 
+-			if (Emu.IsStopped() || fail_flag)
++			if (Emu.IsStopped() || fail_flag || compiler_dead)
+ 			{
+ 				continue;
+ 			}
+@@ -1088,6 +1223,11 @@ void spu_cache::initialize(bool build_existing_cache)
+ 			}
+ 			else if (!compile_program(std::move(func2)))
+ 			{
++				if (compile_fault)
++				{
++					continue;
++				}
++
+ 				// Likely, out of JIT memory. Signal to prevent further building.
+ 				fail_flag |= 1;
+ 				continue;
+@@ -1149,7 +1289,7 @@ void spu_cache::initialize(bool build_existing_cache)
+ 				break;
+ 			}
+ 
+-			if (Emu.IsStopped() || fail_flag)
++			if (Emu.IsStopped() || fail_flag || compiler_dead)
+ 			{
+ 				continue;
+ 			}
+@@ -1186,6 +1326,11 @@ void spu_cache::initialize(bool build_existing_cache)
+ 
+ 				if (!compile_program(std::move(func2)))
+ 				{
++					if (compile_fault)
++					{
++						break;
++					}
++
+ 					// Likely, out of JIT memory. Signal to prevent further building.
+ 					fail_flag |= 1;
+ 					break;
+@@ -1431,10 +1576,34 @@ spu_function_t spu_runtime::rebuild_ubertrampoline(u32 id_inst)
+ 	// Prepare sorted list
+ 	static thread_local std::vector<std::pair<std::span<const u32>, spu_function_t>> m_flat_list;
+ 
++#ifdef __PROSPERO__
++	const bool spurs = spu_ps5_compiling_spurs();
++	static std::mutex spurs_tramp_mu;
++	std::unique_lock<std::mutex> spurs_lock(spurs_tramp_mu, std::defer_lock);
++	if (spurs)
++	{
++		spurs_lock.lock();
++	}
++#else
++	constexpr bool spurs = false;
++#endif
++
+ 	// Remember top position
+ 	auto stuff_it = ::at32(m_stuff, id_inst >> 12).begin();
+ 	auto stuff_end = ::at32(m_stuff, id_inst >> 12).end();
+ 	{
++#ifdef __PROSPERO__
++		if (spurs)
++		{
++			// This function was just compiled. Drop the old trampoline so the
++			// rebuild below includes it.
++			for (auto it = stuff_it; it != stuff_end; ++it)
++			{
++				it->trampoline_spurs.release(nullptr);
++			}
++		}
++		else
++#endif
+ 		if (stuff_it->trampoline)
+ 		{
+ 			return stuff_it->trampoline;
+@@ -1444,7 +1613,12 @@ spu_function_t spu_runtime::rebuild_ubertrampoline(u32 id_inst)
+ 
+ 		for (auto it = stuff_it; it != stuff_end; ++it)
+ 		{
+-			if (const auto ptr = it->compiled.load())
++#ifdef __PROSPERO__
++			const auto ptr = spurs ? it->compiled_spurs.load() : it->compiled.load();
++#else
++			const auto ptr = it->compiled.load();
++#endif
++			if (ptr)
+ 			{
+ 				std::span<const u32> range{it->data.data.data(), it->data.data.size()};
+ 				range = range.subspan((it->data.entry_point - it->data.lower_bound) / 4);
+@@ -1458,6 +1632,11 @@ spu_function_t spu_runtime::rebuild_ubertrampoline(u32 id_inst)
+ 		}
+ 	}
+ 
++	if (m_flat_list.empty())
++	{
++		return nullptr;
++	}
++
+ 	std::sort(m_flat_list.begin(), m_flat_list.end(), FN(s_span_less<const u32>(x.first, y.first)));
+ 
+ 	struct work
+@@ -1974,13 +2153,29 @@ spu_function_t spu_runtime::rebuild_ubertrampoline(u32 id_inst)
+ 		jit_announce(wxptr, raw - wxptr, fname);
+ 	}
+ 
+-	if (auto _old = stuff_it->trampoline.compare_and_swap(nullptr, result))
++#ifdef __PROSPERO__
++	auto& trampoline_slot = spurs ? stuff_it->trampoline_spurs : stuff_it->trampoline;
++#else
++	auto& trampoline_slot = stuff_it->trampoline;
++#endif
++
++	if (auto _old = trampoline_slot.compare_and_swap(nullptr, result))
+ 	{
+ 		return _old;
+ 	}
+ 
+ 	// Install ubertrampoline
++#ifdef __PROSPERO__
++	auto& insert_to = ::at32(*(spurs ? spu_runtime::g_dispatcher_spurs : spu_runtime::g_dispatcher), id_inst >> 12);
++	if (spurs)
++	{
++		// The mutex above is the only writer. Always publish the new trampoline.
++		insert_to.release(result);
++		return result;
++	}
++#else
+ 	auto& insert_to = ::at32(*spu_runtime::g_dispatcher, id_inst >> 12);
++#endif
+ 
+ 	auto _old = insert_to.load();
+ 
+@@ -2036,6 +2231,185 @@ spu_function_t spu_runtime::find(const u32* ls, u32 addr) const
+ 	return nullptr;
+ }
+ 
++#ifdef __PROSPERO__
++static bool ps5_spu_program_matches(const spu_item& item, const u32* ls, u32 addr)
++{
++	std::span<const u32> range{item.data.data.data(), item.data.data.size()};
++	range = range.subspan((item.data.entry_point - item.data.lower_bound) / 4);
++
++	if (addr / 4 + range.size() > 0x10000)
++	{
++		return false;
++	}
++
++	return std::equal(range.begin(), range.end(), ls + addr / 4);
++}
++
++struct ps5_spurs_llvm_queue
++{
++	std::mutex mu;
++	std::condition_variable cv;
++	std::vector<spu_item*> items;
++	std::atomic<bool> started{false};
++};
++
++static ps5_spurs_llvm_queue g_ps5_spurs_llvm_q;
++
++static void ps5_queue_spurs_llvm(spu_item* item)
++{
++	if (!g_ps5_spurs_llvm_q.started.exchange(true))
++	{
++		std::thread([]()
++		{
++			// Stay off the cores the game is using. The frame keeps running
++			// on the ASMJIT functions until each LLVM function is ready.
++			thread_ctrl::scoped_priority low_prio(-1);
++
++			std::unique_ptr<spu_recompiler_base> compiler = spu_recompiler_base::make_llvm_recompiler();
++			compiler->init();
++			std::vector<be_t<u32>> ls(0x10000);
++
++			for (;;)
++			{
++				spu_item* item = nullptr;
++
++				{
++					std::unique_lock lock(g_ps5_spurs_llvm_q.mu);
++					g_ps5_spurs_llvm_q.cv.wait(lock, [] { return !g_ps5_spurs_llvm_q.items.empty(); });
++					item = g_ps5_spurs_llvm_q.items.back();
++					g_ps5_spurs_llvm_q.items.pop_back();
++				}
++
++				if (!item || item->spurs_kind.load() != 1 || !compiler)
++				{
++					continue;
++				}
++
++				// compile() reads the block map filled by analyse(). Passing the
++				// cached bytes straight in leaves that map empty and the lookup
++				// at the entry point aborts the process.
++				const u32 start = item->data.lower_bound;
++				const u32 size0 = ::size32(item->data.data);
++
++				for (u32 i = 0, pos = start; i < size0; i++, pos += 4)
++				{
++					ls[pos / 4] = std::bit_cast<be_t<u32>>(item->data.data[i]);
++				}
++
++				spu_ps5_set_compiling_spurs(true);
++				g_spu_compile_faulted = false;
++				spu_program analysed = compiler->analyse(ls.data(), item->data.entry_point);
++				spu_function_t fn = nullptr;
++
++				if (analysed == item->data)
++				{
++					fn = compile_catching_host_fault(*compiler, std::move(analysed));
++				}
++				else
++				{
++					spu_log.error("PS5 SPU LLVM analyse mismatch at 0x%x", item->data.entry_point);
++				}
++
++				spu_ps5_set_compiling_spurs(false);
++
++				if (size0)
++				{
++					std::memset(ls.data() + start / 4, 0, 4ull * size0);
++				}
++
++				if (!fn || g_spu_compile_faulted)
++				{
++					spu_log.error("PS5 SPU LLVM upgrade failed at 0x%x; this block stays on ASMJIT", item->data.entry_point);
++					item->spurs_kind = 3;
++
++					if (g_spu_compile_faulted)
++					{
++						compiler.release();
++						compiler = spu_recompiler_base::make_llvm_recompiler();
++
++						if (compiler)
++						{
++							compiler->init();
++						}
++					}
++				}
++			}
++		}).detach();
++	}
++
++	{
++		std::lock_guard lock(g_ps5_spurs_llvm_q.mu);
++		g_ps5_spurs_llvm_q.items.push_back(item);
++	}
++
++	g_ps5_spurs_llvm_q.cv.notify_one();
++}
++
++spu_function_t spu_runtime::find_spurs(const u32* ls, u32 addr) const
++{
++	const u32 index = ls[addr / 4] >> 12;
++
++	for (const auto& item : ::at32(m_stuff, index))
++	{
++		if (item.spurs_kind.load() != 2)
++		{
++			continue;
++		}
++
++		if (const auto ptr = item.compiled_spurs.load())
++		{
++			if (ps5_spu_program_matches(item, ls, addr))
++			{
++				return ptr;
++			}
++		}
++	}
++
++	return find(ls, addr);
++}
++
++spu_function_t spu_runtime::arm_spurs(const u32* ls, u32 addr)
++{
++	const u32 index = ls[addr / 4] >> 12;
++
++	for (auto& item : ::at32(m_stuff, index))
++	{
++		const auto asmjit = item.compiled.load();
++
++		if (!asmjit || !ps5_spu_program_matches(item, ls, addr))
++		{
++			continue;
++		}
++
++		if (item.spurs_kind.load() == 2)
++		{
++			if (const auto llvm = item.compiled_spurs.load())
++			{
++				return llvm;
++			}
++		}
++
++		// Publish the ASMJIT function into the SPURS dispatcher immediately.
++		// LLVM is compiled on another thread and replaces it when it is done.
++		if (item.spurs_kind.compare_and_swap_test(0, 1))
++		{
++			item.compiled_spurs.compare_and_swap(nullptr, asmjit);
++
++			if (spu_ps5_compiling_spurs())
++			{
++				rebuild_ubertrampoline(item.data.data[0]);
++			}
++
++			ps5_queue_spurs_llvm(&item);
++		}
++
++		return asmjit;
++	}
++
++	return nullptr;
++}
++#endif
++
+ spu_function_t spu_runtime::make_branch_patchpoint(u16 data) const
+ {
+ #if defined(ARCH_X64)
+@@ -2133,6 +2507,32 @@ spu_recompiler_base::~spu_recompiler_base()
+ 
+ void spu_recompiler_base::dispatch(spu_thread& spu, void*, u8* rip)
+ {
++	// Mega keeps the Bink decoder (RADT5) in one block, which is why the 2D
++	// movie holds 30 fps. The same size makes a SPURS job take seconds to
++	// compile, so the first 3D frame stays on screen while audio continues.
++	struct block_size_scope
++	{
++		const spu_block_size_type* previous = g_tls_spu_block_size_override;
++		spu_block_size_type safe = spu_block_size_type::safe;
++
++		explicit block_size_scope(const spu_thread& spu)
++		{
++			const std::string name = *spu.spu_tname.load();
++
++			if (name.find("RAD") != std::string::npos)
++			{
++				return;
++			}
++
++			g_tls_spu_block_size_override = &safe;
++		}
++
++		~block_size_scope()
++		{
++			g_tls_spu_block_size_override = previous;
++		}
++	} block_size(spu);
++
+ 	// If code verification failed from a patched patchpoint, clear it with a dispatcher jump
+ 	if (rip)
+ 	{
+@@ -2196,8 +2596,40 @@ void spu_recompiler_base::dispatch(spu_thread& spu, void*, u8* rip)
+ 		return;
+ 	}
+ 
++	if (!spu.jit)
++	{
++		spu_runtime::g_tail_escape(&spu, spu_runtime::tr_interpreter, nullptr);
++		return;
++	}
++
+ 	spu.jit->init();
+ 
++#ifdef __PROSPERO__
++	// siglongjmp out of compile() skips destructors, so the fault handler
++	// also clears this flag.
++	struct spurs_compile_flag
++	{
++		bool active = false;
++
++		explicit spurs_compile_flag(bool on)
++			: active(on)
++		{
++			if (on)
++			{
++				spu_ps5_set_compiling_spurs(true);
++			}
++		}
++
++		~spurs_compile_flag()
++		{
++			if (active)
++			{
++				spu_ps5_set_compiling_spurs(false);
++			}
++		}
++	} spurs_flag(spu.ps5_spurs != 0);
++#endif
++
+ 	// Compile
+ 	if (spu._ref<u32>(spu.pc) == 0u)
+ 	{
+@@ -2205,6 +2637,20 @@ void spu_recompiler_base::dispatch(spu_thread& spu, void*, u8* rip)
+ 		return;
+ 	}
+ 
++#ifdef __PROSPERO__
++	if (spu.ps5_spurs)
++	{
++		// The ASMJIT function is already in the cache. Run it now. Compiling
++		// LLVM on this thread is what held the white frame while audio continued.
++		if (const auto fn = spu.jit->get_runtime().arm_spurs(static_cast<u32*>(spu._ptr<void>(0)), spu.pc))
++		{
++			spu_ps5_set_compiling_spurs(false);
++			spu_runtime::g_tail_escape(&spu, fn, nullptr);
++			return;
++		}
++	}
++#endif
++
+ #if defined(__APPLE__)
+ 	pthread_jit_write_protect_np(false);
+ #endif
+@@ -2212,13 +2658,35 @@ void spu_recompiler_base::dispatch(spu_thread& spu, void*, u8* rip)
+ #ifdef ARCH_ARM64
+ 	const auto func = compile_spu_llvm_with_retry(spu.jit, program);
+ #else
+-	const auto func = spu.jit->compile(std::move(program));
++	spu_function_t func = compile_catching_host_fault(*spu.jit, std::move(program));
+ #endif
+ 
+ 	if (!func)
+ 	{
+-		spu_log.fatal("[0x%05x] Compilation failed.", spu.pc);
+-		return;
++#ifdef __PROSPERO__
++		if (spu.ps5_spurs)
++		{
++			// The compiler is not safe to destroy or reuse after a host fault.
++			// Leak it and run this thread on the ASMJIT dispatcher, which already
++			// has the Bink-safe cached functions.
++			spu_log.error("[0x%05x] SPU LLVM compile failed; this thread is switching back to ASMJIT.", spu.pc);
++			spu.ps5_spurs = 0;
++			spu.jit.release();
++			spu.jit = spu_recompiler_base::make_asmjit_recompiler();
++			spu.jit->init();
++			spu_runtime::g_tail_escape(&spu, spu_runtime::tr_all, nullptr);
++			return;
++		}
++#endif
++		spu_log.error("[0x%05x] SPU compile failed; using the interpreter.", spu.pc);
++
++		if (g_spu_compile_faulted)
++		{
++			spu.jit.release();
++		}
++
++		func = spu_runtime::tr_interpreter;
++		::at32(*spu_runtime::g_dispatcher, spu._ref<nse_t<u32>>(spu.pc) >> 12).raw() = func;
+ 	}
+ 
+ 	// Diagnostic
+@@ -2257,7 +2725,13 @@ void spu_recompiler_base::branch(spu_thread& spu, void*, u8* rip)
+ 	}
+ 
+ 	// Find function
++#ifdef __PROSPERO__
++	const auto func = spu.ps5_spurs
++		? spu.jit->get_runtime().find_spurs(static_cast<u32*>(spu._ptr<void>(0)), spu.pc)
++		: spu.jit->get_runtime().find(static_cast<u32*>(spu._ptr<void>(0)), spu.pc);
++#else
+ 	const auto func = spu.jit->get_runtime().find(static_cast<u32*>(spu._ptr<void>(0)), spu.pc);
++#endif
+ 
+ 	if (!func)
+ 	{
+@@ -2341,7 +2815,10 @@ void spu_recompiler_base::branch(spu_thread& spu, void*, u8* rip)
+ 
+ void spu_recompiler_base::old_interpreter(spu_thread& spu, void* ls, u8* /*rip*/)
+ {
+-	if (g_cfg.core.spu_decoder != spu_decoder_type::_static)
++	// LLVM compiles that fault on this port fall back here. The C++ interpreter
++	// still executes the block; only an unknown decoder is fatal.
++	if (g_cfg.core.spu_decoder != spu_decoder_type::_static &&
++		g_cfg.core.spu_decoder != spu_decoder_type::llvm)
+ 	{
+ 		fmt::throw_exception("Invalid SPU decoder");
+ 	}
+@@ -9033,6 +9510,10 @@ struct spu_llvm_worker
+ 
+ 		bool set_relax_flag = false;
+ 
++		// A host fault longjmps out of LLVM while it still holds its lock.
++		// Rebuilding the compiler on this worker deadlocks the cache dialog.
++		bool llvm_dead = false;
++
+ 		for (auto slice = registered.pop_all();; [&]
+ 		{
+ 			if (slice)
+@@ -9072,7 +9553,7 @@ struct spu_llvm_worker
+ 				break;
+ 			}
+ 
+-			if (!compiler)
++			if (!compiler && !llvm_dead)
+ 			{
+ 				// Postponed initialization
+ 				compiler = spu_recompiler_base::make_llvm_recompiler();
+@@ -9099,26 +9580,38 @@ struct spu_llvm_worker
+ 				ls[pos / 4] = std::bit_cast<be_t<u32>>(func.data[i]);
+ 			}
+ 
+-			// Call analyser
+-			spu_program func2 = compiler->analyse(ls.data(), func.entry_point);
++			spu_function_t target = nullptr;
+ 
+-			if (func2 != func)
+-			{
+-				spu_log.error("[0x%05x] SPU Analyser failed, %u vs %u", func2.entry_point, func2.data.size(), size0);
+-			}
+-			else
++			if (compiler)
+ 			{
++				// Call analyser
++				spu_program func2 = compiler->analyse(ls.data(), func.entry_point);
++
++				if (func2 != func)
++				{
++					spu_log.error("[0x%05x] SPU Analyser failed, %u vs %u", func2.entry_point, func2.data.size(), size0);
++				}
++				else
++				{
+ #ifdef ARCH_ARM64
+-				const auto target = compile_spu_llvm_with_retry(compiler, func2);
++					target = compile_spu_llvm_with_retry(compiler, func2);
+ #else
+-				const auto target = compiler->compile(std::move(func2));
++					target = compile_catching_host_fault(*compiler, std::move(func2));
+ #endif
++				}
++			}
++
++			if (!target)
++			{
++				spu_log.error("[0x%05x] SPU compile failed; using the interpreter.", func.entry_point);
++				target = spu_runtime::tr_interpreter;
+ 
+-				if (!target)
++				if (g_spu_compile_faulted && compiler)
+ 				{
+-					spu_log.fatal("[0x%05x] Compilation failed.", func.entry_point);
+-					break;
++					compiler.release();
++					llvm_dead = true;
+ 				}
++			}
+ 
+ 				// Redirect old function (TODO: patch in multiple places)
+ 				const s64 rel = reinterpret_cast<u64>(target) - prog->first - 5;
+@@ -9136,7 +9629,6 @@ struct spu_llvm_worker
+ 				bytes[7] = 0x90;
+ 
+ 				atomic_storage<u64>::release(*reinterpret_cast<u64*>(prog->first), result);
+-			}
+ 
+ 			// Clear fake LS
+ 			std::memset(ls.data() + start / 4, 0, 4 * (size0 - 1));
+diff --git a/rpcs3/Emu/Cell/SPULLVMRecompiler.cpp b/rpcs3/Emu/Cell/SPULLVMRecompiler.cpp
+index ad762e82f..8b4761e84 100644
+--- a/rpcs3/Emu/Cell/SPULLVMRecompiler.cpp
++++ b/rpcs3/Emu/Cell/SPULLVMRecompiler.cpp
+@@ -1767,6 +1767,18 @@ public:
+ 			return nullptr;
+ 		}
+ 
++#ifdef __PROSPERO__
++		// Kind 2 is a finished LLVM function. Kind 1 is the ASMJIT placeholder
++		// the game is already running; that one still needs to be compiled.
++		if (spu_ps5_compiling_spurs() && add_loc->spurs_kind.load() == 2)
++		{
++			if (const auto existing = add_loc->compiled_spurs.load())
++			{
++				return existing;
++			}
++		}
++#endif
++
+ 		const spu_program& func = add_loc->data;
+ 
+ 		if (func.entry_point != start0)
+@@ -4129,8 +4141,19 @@ public:
+ 		ps5_jit_name(reinterpret_cast<u64>(fn), fmt::format("spu-%05x-%s", func.entry_point, m_hash));
+ #endif
+ 
+-		// Install unconditionally, possibly replacing existing one from spu_fast
+-		add_loc->compiled = fn;
++		// Install unconditionally, possibly replacing existing one from spu_fast.
++		// SPURS keeps its function beside the ASMJIT one so Bink is unchanged.
++#ifdef __PROSPERO__
++		if (spu_ps5_compiling_spurs())
++		{
++			add_loc->compiled_spurs = fn;
++			add_loc->spurs_kind = 2;
++		}
++		else
++#endif
++		{
++			add_loc->compiled = fn;
++		}
+ 
+ 		// Rebuild trampoline if necessary
+ 		if (!m_spurt->rebuild_ubertrampoline(func.data[0]))
+diff --git a/rpcs3/Emu/Cell/SPURecompiler.h b/rpcs3/Emu/Cell/SPURecompiler.h
+index cc03c8e9a..b68dff1ee 100644
+--- a/rpcs3/Emu/Cell/SPURecompiler.h
++++ b/rpcs3/Emu/Cell/SPURecompiler.h
+@@ -76,6 +76,13 @@ struct spu_llvm_compile_context
+ void spu_llvm_set_compile_context(spu_llvm_compile_context* context) noexcept;
+ #endif
+ 
++#ifdef __PROSPERO__
++// Set while a SPURS thread is compiling. The trampoline rebuild then fills
++// g_dispatcher_spurs and leaves the Bink dispatcher alone.
++bool spu_ps5_compiling_spurs() noexcept;
++void spu_ps5_set_compiling_spurs(bool on) noexcept;
++#endif
++
+ class spu_item
+ {
+ public:
+@@ -88,6 +95,14 @@ public:
+ 	// Ubertrampoline generated for this item when it was latest
+ 	atomic_t<spu_function_t> trampoline = nullptr;
+ 
++#ifdef __PROSPERO__
++	// Second copy for SPURS threads. The Bink threads keep using `compiled`.
++	atomic_t<spu_function_t> compiled_spurs = nullptr;
++	atomic_t<spu_function_t> trampoline_spurs = nullptr;
++	// 0 unused, 1 ASMJIT placeholder, 2 LLVM ready, 3 LLVM failed
++	atomic_t<u8> spurs_kind{0};
++#endif
++
+ 	atomic_t<u8> cached = false;
+ 	atomic_t<u8> logged = false;
+ 
+@@ -148,12 +163,26 @@ public:
+ 	// Find existing function
+ 	spu_function_t find(const u32* ls, u32 addr) const;
+ 
++#ifdef __PROSPERO__
++	// SPURS lookup: the LLVM function once it exists, otherwise the ASMJIT one.
++	spu_function_t find_spurs(const u32* ls, u32 addr) const;
++
++	// Point the SPURS dispatcher at the ASMJIT function and compile LLVM beside it.
++	// Returns the function to run on this entry.
++	spu_function_t arm_spurs(const u32* ls, u32 addr);
++#endif
++
+ 	// Generate a patchable trampoline to spu_recompiler_base::branch
+ 	spu_function_t make_branch_patchpoint(u16 data = 0) const;
+ 
+ 	// All dispatchers (array allocated in jit memory)
+ 	static std::array<atomic_t<spu_function_t>, (1 << 20)>* const g_dispatcher;
+ 
++#ifdef __PROSPERO__
++	// SPURS dispatcher. Bink (RAD) threads stay on g_dispatcher.
++	static std::array<atomic_t<spu_function_t>, (1 << 20)>* const g_dispatcher_spurs;
++#endif
++
+ 	// Recompiler entry point
+ 	static const spu_function_t g_gateway;
+ 
+diff --git a/rpcs3/Emu/Cell/SPUThread.cpp b/rpcs3/Emu/Cell/SPUThread.cpp
+index 9c8064979..a41cac4f7 100644
+--- a/rpcs3/Emu/Cell/SPUThread.cpp
++++ b/rpcs3/Emu/Cell/SPUThread.cpp
+@@ -1,4 +1,36 @@
+ #include "stdafx.h"
++#ifdef __PROSPERO__
++#include <sys/types.h>
++#include <sys/umtx.h>
++#include <time.h>
++
++// The shared wait table returns as soon as any other SPU stores, so a reservation
++// wait becomes a spin. A private _umtx_op wait does not come back for a few hundred
++// microseconds on this kernel (the same call with a multi-millisecond PPU usleep does).
++// Once every SPU is in that wait, nothing stores the line they are all watching.
++// clock_nanosleep returns after the requested time.
++static void ps5_sleep_us(u64 usec)
++{
++	if (!usec)
++	{
++		return;
++	}
++
++	timespec ts{};
++	ts.tv_sec = static_cast<time_t>(usec / 1'000'000);
++	ts.tv_nsec = static_cast<long>((usec % 1'000'000) * 1'000);
++
++	for (;;)
++	{
++		const int rc = clock_nanosleep(CLOCK_MONOTONIC, 0, &ts, &ts);
++
++		if (rc != EINTR)
++		{
++			return;
++		}
++	}
++}
++#endif
+ #include "Utilities/JIT.h"
+ #include "Utilities/date_time.h"
+ #include "Emu/Memory/vm.h"
+@@ -498,6 +530,13 @@ mwaitx_func static void __mwaitx(u32 cycles, u32 cstate, const void* cline, cons
+ {
+ 	constexpr u32 timer_enable = 0x2;
+ 
++	// MWAITX with a timeout of 0 does not arm the timer: it waits until the monitored
++	// line is stored. The reservation checker calls this with spin_count 0, so that
++	// first wait never returned and the SPU held a core for the whole event
++	// (RdEventStat at 99%). Callers increment the spin and pass a real timeout next time.
++	if (!cycles)
++		return;
++
+ 	// monitorx will wake if the cache line is written to, use it for reservations which fits it almost perfectly
+ 	_mm_monitorx(const_cast<void*>(cline), 0, 0);
+ 
+@@ -1788,6 +1827,13 @@ void spu_thread::init_spu_decoder()
+ 	const spu_decoder_type spu_decoder = g_cfg.core.spu_decoder;
+ 
+ #if defined(ARCH_X64)
++#ifdef __PROSPERO__
++	// LLVM codegen on this CPU faults inside the compiler and that fault kills
++	// the process (the signal is not always on the thread that set the jump).
++	// Every SPU, including SPURS, stays on ASMJIT. ps5_spurs stays 0 so the
++	// background LLVM upgrade never starts.
++	ps5_spurs = 0;
++#endif
+ 	if (spu_decoder == spu_decoder_type::asmjit)
+ 	{
+ 		jit = spu_recompiler_base::make_asmjit_recompiler();
+@@ -4243,6 +4289,18 @@ bool spu_thread::process_mfc_cmd()
+ 			break;
+ 		}
+ 
++#ifdef __PROSPERO__
++		// The other SPUs are asleep on a private reservation word and do not
++		// notify this state. An infinite wait never returns, the queue stays
++		// full, and the store those SPUs are waiting on never runs.
++		state += cpu_flag::wait;
++		ps5_sleep_us(200);
++
++		if (test_stopped())
++		{
++			return false;
++		}
++#else
+ 		auto old = state.add_fetch(cpu_flag::wait);
+ 
+ 		if (is_stopped(old))
+@@ -4251,6 +4309,7 @@ bool spu_thread::process_mfc_cmd()
+ 		}
+ 
+ 		thread_ctrl::wait_on(state, old);
++#endif
+ 	}
+ 
+ 	spu::scheduler::concurrent_execution_watchdog watchdog(*this);
+@@ -4384,6 +4443,14 @@ bool spu_thread::process_mfc_cmd()
+ 								}
+ 							}
+ 
++#ifdef __PROSPERO__
++							// MWAITX never returns on this CPU, so a busy GETLLAR holds the
++							// core until the next signal and the animation line is never stored.
++							if (getllar_busy_waiting_switch == 1)
++							{
++								getllar_busy_waiting_switch = 0;
++							}
++#endif
+ 							// Either 1 or umax
+ 							return getllar_busy_waiting_switch != 0;
+ 						}())
+@@ -4454,8 +4521,14 @@ bool spu_thread::process_mfc_cmd()
+ 						if (auto [wait_var, flag_val] = vm::reservation_notifier_begin_wait(addr, rtime); wait_var)
+ 						{
+ 							cache_line_waiter_index = register_cache_line_waiter(addr);
++#ifdef __PROSPERO__
++							vm::reservation_notifier_end_wait(*wait_var);
++							// Private sleep: the shared wait wakes on unrelated stores.
++							ps5_sleep_us(200);
++#else
+ 							utils::bless<atomic_t<u32>>(&wait_var->raw().wait_flag)->wait(flag_val, atomic_wait_timeout{100'000});
+ 							vm::reservation_notifier_end_wait(*wait_var);
++#endif
+ 						}
+ 
+ 						deregister_cache_line_waiter(cache_line_waiter_index);
+@@ -5659,6 +5732,11 @@ s64 spu_thread::get_ch_value(u32 ch)
+ 				val = static_cast<u8>(std::min<u32>(val + 1, u8{umax}));
+ 			}
+ 
++			// MWAITX never wakes on the PS5 CPU, zero timeout or not. The checker
++			// then sits in that instruction for the whole reservation and holds
++			// a core (sampled on the jmp after mwaitx for the entire session).
++			// The sleep path below still observes the reservation line.
++#ifndef __PROSPERO__
+ 			if (!s_is_reservation_data_checking_thread && utils::get_thread_count() >= 12)// && std::find(raddr_busy_wait_addr.begin(), raddr_busy_wait_addr.end(), raddr) != raddr_busy_wait_addr.end())
+ 			{
+ 				if (s_is_reservation_data_checking_thread.compare_and_swap_test(0, 1))
+@@ -5669,6 +5747,7 @@ s64 spu_thread::get_ch_value(u32 ch)
+ 					eventstat_spin_count = 0;
+ 				}
+ 			}
++#endif
+ 
+ 			lv2_obj::notify_all();
+ 		}
+@@ -5767,7 +5846,9 @@ s64 spu_thread::get_ch_value(u32 ch)
+ 				// Don't be stubborn, force operating sleep if too much time has passed
+ 				const u64 time_since = get_system_time() - eventstat_evaluate_time;
+ 
+-				if (!is_reservation_data_checking_thread && time_since >= (utils::get_thread_count() >= 9 ? 50'000 : 3000))
++				// The checker used to be exempt from this cap and busy-waited for the whole
++				// event. The sleep path below still observes the reservation line.
++				if (time_since >= (utils::get_thread_count() >= 9 ? 50'000 : 3000))
+ 				{
+ 					spu_log.trace("SPU RdEventStat wait for 0x%x failed", raddr);
+ 					history.front() = 2;
+@@ -5842,15 +5923,26 @@ s64 spu_thread::get_ch_value(u32 ch)
+ 
+ 							if (thread_count && seed % thread_count < work_count - true_free)
+ 							{
+-								// Make the SPU wait longer for other threads to do the work
++								// Make the SPU wait longer for other threads to do the work.
++								// On the console the alert flag is already set, so the default
++								// wait returns at once and the SPU keeps the core.
++#ifdef __PROSPERO__
++								ps5_sleep_us(200);
++#else
+ 								thread_ctrl::wait_for(200);
++#endif
+ 								continue;
+ 							}
+ 						}
+ 					}
+ 
+-					// Check other reservations in other threads
++					// Check other reservations in other threads.
++					// On the console this runs from every waiter on every pass. Each call
++					// wakes the others, so five SPUs sat near 90% on one lock line and the
++					// animation job never got a core. A store still wakes the wait below.
++#ifndef __PROSPERO__
+ 					lv2_obj::notify_all();
++#endif
+ 
+ 					if (raddr - spurs_addr <= 0x80 && !g_cfg.core.spu_accurate_reservations && mask1 == SPU_EVENT_LR)
+ 					{
+@@ -5875,7 +5967,7 @@ s64 spu_thread::get_ch_value(u32 ch)
+ 					}
+ 
+ 					const u32 _raddr = this->raddr;
+-#ifdef __linux__
++#if defined(__linux__) || defined(__PROSPERO__)
+ 					if (auto [wait_var, flag_val] = vm::reservation_notifier_begin_wait(_raddr, rtime); wait_var)
+ 					{
+ 						if (!cmp_rdata(rdata, *resrv_mem))
+@@ -5885,7 +5977,23 @@ s64 spu_thread::get_ch_value(u32 ch)
+ 						}
+ 						else if (check_cache_line_waiter())
+ 						{
+-							utils::bless<atomic_t<u32>>(&wait_var->raw().wait_flag)->wait(flag_val, atomic_wait_timeout{50'000});
++#ifdef __PROSPERO__
++							// This futex is hashed, so stores to other lines wake it too.
++							// Five SPUs then sit near 90% and the write that ends the shot
++							// never gets a core, so the next camera never starts. Recheck
++							// the line on a timer instead. The loop above sees a real store.
++							vm::reservation_notifier_end_wait(*wait_var);
++							// Private sleep. The shared wait returns at once while the other
++							// SPUs are also waiting, so all five spin and the camera store
++							// never runs. The loop above sees a real store after this returns.
++							ps5_sleep_us(400);
++							continue;
++#else
++							// The other path installs a callback that calls notify_all and then
++							// ignores the timeout.
++							constexpr auto wait_timeout = atomic_wait_timeout{50'000};
++							utils::bless<atomic_t<u32>>(&wait_var->raw().wait_flag)->wait(flag_val, wait_timeout);
++#endif
+ 						}
+ 
+ 						vm::reservation_notifier_end_wait(*wait_var);
+diff --git a/rpcs3/Emu/Cell/SPUThread.h b/rpcs3/Emu/Cell/SPUThread.h
+index b1f701743..25cd436d2 100644
+--- a/rpcs3/Emu/Cell/SPUThread.h
++++ b/rpcs3/Emu/Cell/SPUThread.h
+@@ -666,6 +666,8 @@ public:
+ 	bool savable() const { return get_type() != spu_type::threaded; } // Threaded SPUs are saved as part of the SPU group
+ 
+ 	u32 pc = 0;
++	// Non-Bink SPU. tr_all sends these threads through the LLVM dispatcher.
++	u8 ps5_spurs = 0;
+ 	u32 dbg_step_pc = 0;
+ 
+ 	// May be used internally by recompilers.
+diff --git a/rpcs3/Emu/Cell/lv2/lv2.cpp b/rpcs3/Emu/Cell/lv2/lv2.cpp
+index 0308fb5d1..a38a3e16c 100644
+--- a/rpcs3/Emu/Cell/lv2/lv2.cpp
++++ b/rpcs3/Emu/Cell/lv2/lv2.cpp
+@@ -1,4 +1,9 @@
+ #include "stdafx.h"
++#ifdef __PROSPERO__
++#include <sys/types.h>
++#include <sys/umtx.h>
++#include <time.h>
++#endif
+ #include "Emu/System.h"
+ #include "Emu/system_config.h"
+ #include "Emu/Memory/vm_ptr.h"
+@@ -2222,6 +2227,28 @@ bool lv2_obj::wait_timeout(u64 usec, ppu_thread* cpu, bool scale, bool is_usleep
+ 		}
+ 
+ 		u64 remaining = usec - passed;
++#ifdef __PROSPERO__
++		if (is_usleep)
++		{
++			// The shared wait table wakes this sleep whenever an SPU stores.
++			// During the 3D cutscene that return is immediate, so the rest of every
++			// usleep is a clock poll and the game thread sits near 90%. The animation
++			// job then misses 30 fps while audio stays on the clock.
++			// Wait on a private word. Cond, event, and mutex waits still use the
++			// wake below, which is what keeps the 2D movie at 30 fps.
++			u32 lane = 0;
++			_umtx_time ut{};
++			ut._timeout.tv_sec = static_cast<time_t>(remaining / 1'000'000);
++			ut._timeout.tv_nsec = static_cast<long>((remaining % 1'000'000) * 1'000);
++			ut._flags = 0;
++			ut._clockid = CLOCK_MONOTONIC;
++			_umtx_op(&lane, UMTX_OP_WAIT_UINT_PRIVATE, 0, reinterpret_cast<void*>(sizeof(ut)), &ut);
++		}
++		else
++		{
++			wait_for(remaining);
++		}
++#else
+ #ifdef __linux__
+ 		// NOTE: Assumption that timer initialization has succeeded
+ 		constexpr u64 host_min_quantum = 10;
+@@ -2270,6 +2297,7 @@ bool lv2_obj::wait_timeout(u64 usec, ppu_thread* cpu, bool scale, bool is_usleep
+ 				std::this_thread::yield();
+ 			}
+ 		}
++#endif
+ 
+ 		passed = get_system_time() - start_time;
+ 	}
+diff --git a/rpcs3/Emu/Cell/lv2/sys_ppu_thread.cpp b/rpcs3/Emu/Cell/lv2/sys_ppu_thread.cpp
+index e5c556d3b..2103c7447 100644
+--- a/rpcs3/Emu/Cell/lv2/sys_ppu_thread.cpp
++++ b/rpcs3/Emu/Cell/lv2/sys_ppu_thread.cpp
+@@ -575,6 +575,10 @@ error_code sys_ppu_thread_start(ppu_thread& ppu, u32 thread_id)
+ 			return CELL_EBUSY;
+ 		}
+ 
++		// test_and_reset does not notify. The host thread may already be inside
++		// state.wait() for the stop flag, and without this it never reaches cpu_task.
++		thread.state.notify_one();
++
+ 		is_lower_prio = thread.is_lower_priority_than(ppu);
+ 
+ 		if (!is_lower_prio)
+diff --git a/rpcs3/Emu/Cell/lv2/sys_ss.cpp b/rpcs3/Emu/Cell/lv2/sys_ss.cpp
+index d59a6de66..91c2fa007 100644
+--- a/rpcs3/Emu/Cell/lv2/sys_ss.cpp
++++ b/rpcs3/Emu/Cell/lv2/sys_ss.cpp
+@@ -17,6 +17,11 @@
+ #include <bcrypt.h>
+ #endif
+ 
++#ifdef __PROSPERO__
++// A title cannot open /dev/urandom. ps5platform/libc.h supplies this instead.
++extern "C" void ps5_arc4random_buf(void* buffer, std::size_t bytes);
++#endif
++
+ struct lv2_update_manager
+ {
+ 	lv2_update_manager() noexcept
+@@ -142,6 +147,8 @@ error_code sys_ss_random_number_generator(u64 pkg_id, vm::ptr<void> buf, u64 siz
+ 	{
+ 		fmt::throw_exception("sys_ss_random_number_generator(): BCryptGenRandom failed (0x%08x)", ret);
+ 	}
++#elif defined(__PROSPERO__)
++	ps5_arc4random_buf(temp.get(), static_cast<std::size_t>(size));
+ #else
+ 	fs::file rnd{"/dev/urandom"};
+ 
+diff --git a/rpcs3/Emu/System.cpp b/rpcs3/Emu/System.cpp
+index b1b5b86fa..0c5a36425 100644
+--- a/rpcs3/Emu/System.cpp
++++ b/rpcs3/Emu/System.cpp
+@@ -344,6 +344,23 @@ static void fixup_settings(const psf::registry* _psf)
+ 		}
+ 	}
+ 
++#if defined(__PROSPERO__) && defined(ARCH_X64)
++	if (g_cfg.core.spu_decoder == spu_decoder_type::llvm)
++	{
++		// LLVM codegen faults inside MachineInstr::hasOrderedMemoryRef on this target.
++		// The interpreter fallback then sits on a core and the game stops presenting frames.
++		sys_log.warning("SPU decoder '%s' faults in LLVM on this console and will be changed to '%s' during emulation.",
++			spu_decoder_type::llvm, spu_decoder_type::asmjit);
++		g_cfg.core.spu_decoder.set(spu_decoder_type::asmjit);
++	}
++	// Mega is the Bink decoder's block size. SPURS overrides it to Safe while
++	// compiling. A reloaded config.yml must not put Safe back for the decoder.
++	if (g_cfg.core.spu_block_size != spu_block_size_type::mega)
++	{
++		g_cfg.core.spu_block_size.set(spu_block_size_type::mega);
++	}
++#endif
++
+ #if defined(ARCH_ARM64)
+ 	if (g_cfg.core.spu_decoder == spu_decoder_type::asmjit)
+ 	{
+diff --git a/rpcs3/Emu/system_config_types.h b/rpcs3/Emu/system_config_types.h
+index d846b5843..62e151f27 100644
+--- a/rpcs3/Emu/system_config_types.h
++++ b/rpcs3/Emu/system_config_types.h
+@@ -386,3 +386,8 @@ enum class vsync_mode
+ 	adaptive,
+ 	full,
+ };
++
++// Set for the duration of one SPU compile. operator T() on the block-size
++// setting reads this so a Bink decoder and a SPURS job can compile differently
++// on the same process without racing on the saved config.
++inline thread_local const spu_block_size_type* g_tls_spu_block_size_override = nullptr;
+diff --git a/rpcs3/ps5/ps5_frontend.cpp b/rpcs3/ps5/ps5_frontend.cpp
+index 4b4189c73..134811b9d 100644
+--- a/rpcs3/ps5/ps5_frontend.cpp
++++ b/rpcs3/ps5/ps5_frontend.cpp
+@@ -98,6 +98,9 @@ std::unique_ptr<logs::listener> g_log_file;
+ 
+ std::mutex g_main_mutex;
+ std::deque<std::pair<std::function<void()>, atomic_t<u32>*>> g_main_queue;
++// The title thread both boots games and drains g_main_queue. A callback queued from
++// that thread would wait for a pump that cannot run until the boot call returns.
++pthread_t g_main_owner{};
+ 
+ // UTF-8 to UTF-32 (the native dialogs draw u32 text)
+ std::u32string utf8_to_u32(const std::string& text)
+@@ -238,6 +241,16 @@ void create_callbacks()
+ 
+ 	callbacks.call_from_main_thread = [](std::function<void()> func, atomic_t<u32>* wake_up)
+ 	{
++		if (g_main_owner && pthread_equal(pthread_self(), g_main_owner))
++		{
++			func();
++			if (wake_up)
++			{
++				*wake_up = true;
++				wake_up->notify_one();
++			}
++			return;
++		}
+ 		std::lock_guard lock(g_main_mutex);
+ 		g_main_queue.emplace_back(std::move(func), wake_up);
+ 	};
+@@ -310,11 +323,47 @@ void create_callbacks()
+ 	callbacks.make_video_source = []() -> std::unique_ptr<video_source> { return std::make_unique<ps5_null_video_source>(); };
+ 	callbacks.enable_gamemode = [](bool) {};
+ 	callbacks.get_font_dirs = []() { return std::vector<std::string>{}; };
+-	callbacks.on_install_pkgs = [](const std::vector<std::string>&, bool) { return false; };
++	// Disc extras (PS3_EXTRA/DATA000.PKG) are installed during boot. Returning false
++	// here aborted the boot; queuing the work instead deadlocked the title thread.
++	callbacks.on_install_pkgs = [](const std::vector<std::string>& pkgs, bool from_optical_drive)
++	{
++		if (pkgs.empty())
++			return true;
++		std::deque<package_reader> readers;
++		for (const std::string& path : pkgs)
++		{
++			const std::string name = path.substr(path.find_last_of('/') + 1);
++			host_progress("Installing " + name);
++			sys_log.notice("PS5: installing package %s", path);
++			readers.emplace_back(path);
++			if (!readers.back().is_valid())
++			{
++				sys_log.error("PS5: not a valid package: %s", path);
++				return false;
++			}
++		}
++		std::deque<std::string> bootable;
++		const package_install_result result = package_reader::extract_data(readers, bootable, from_optical_drive);
++		if (result.error != package_install_result::error_type::no_error)
++		{
++			sys_log.error("PS5: package install failed (error %d)", static_cast<int>(result.error));
++			return false;
++		}
++		sys_log.success("PS5: installed %u package(s) from the disc", pkgs.size());
++		return true;
++	};
+ 	callbacks.get_image_info = [](const std::string&, std::string&, s32&, s32&, s32&) { return false; };
+ 	callbacks.get_scaled_image = [](const std::string&, s32, s32, s32&, s32&, u8*, bool) { return false; };
+ 	callbacks.get_photo_path = [](std::string_view) { return std::string{}; };
+-	callbacks.get_database_config = [](const std::string&) { return std::string{}; };
++	callbacks.get_database_config = [](const std::string& title_id) -> std::string
++	{
++		// Official RPCS3 config. NeverDead's lighting pass reads the color buffer
++		// back; without the copy the world is black and only the HUD is drawn.
++		// The settings database is not in the title sandbox, so this stands in for it.
++		if (title_id == "BLUS30654" || title_id == "BLES01303")
++			return "Video:\n  Write Color Buffers: true\n";
++		return {};
++	};
+ 
+ }
+ 
+@@ -325,6 +374,11 @@ void apply_defaults_values()
+ 	// No shader interpreter: its ubershader took minutes to build on the console with the boot waiting on it
+ 	// (console run 15); shaders are recompiled in the background instead
+ 	g_cfg.video.shadermode.set(shader_mode::async_recompiler);
++	// inFamous 2 reads ZCULL every frame while the query is still on the current
++	// command buffer, and that path flushes the GPU and busy-waits. Relaxed sync
++	// reports the query without that stall. Accurate counts disable the early-out.
++	g_cfg.video.relaxed_zcull_sync.set(true);
++	g_cfg.video.precise_zpass_count.set(false);
+ 	// Any renderer but null is the PS5 backend (get_audio); cubeb is the default's name
+ 	g_cfg.audio.renderer.set(audio_renderer::cubeb);
+ 	g_cfg.audio.format.set(audio_format::stereo);
+@@ -332,6 +386,12 @@ void apply_defaults_values()
+ 	g_cfg.audio.music.set(music_handler::null);
+ 	// A title gets 13 CPUs; each LLVM compile thread holds hundreds of MiB of the direct-memory heap
+ 	g_cfg.core.llvm_threads.set(10);
++	// LLVM's SPU codegen faults on this target. ASMJIT compiles the same blocks without that pass.
++	g_cfg.core.spu_decoder.set(spu_decoder_type::asmjit);
++	// Mega keeps the Bink decoder in one block (the 2D movie holds 30 fps).
++	// SPURS jobs compile as Safe: Mega made those blocks take seconds, so the
++	// first 3D frame stayed up while the audio kept going.
++	g_cfg.core.spu_block_size.set(spu_block_size_type::mega);
+ 
+ }
+ 
+@@ -442,6 +502,7 @@ void rpcs3ps5_heartbeat(); // below: the main-thread watchdog
+ std::string ps5_thread_cpu_report(u64 window_ns, usz top); // Utilities/Thread.cpp
+ std::string ps5_thread_profile(const std::string& name, usz count);
+ std::string ps5_thread_top_name(usz i);
++std::string ps5_busy_guest_pcs();
+ namespace utils { extern std::atomic<u64> g_ps5_mprotect_calls, g_ps5_mprotect_tsc, g_ps5_mprotect_bytes; } // vm_native_ps5.cpp
+ 
+ // Waits for wrapped_op, running what was posted to the main thread meanwhile
+@@ -714,6 +775,7 @@ extern "C" int rpcs3ps5_init(const char* root, const rpcs3ps5_host* host)
+ 	// The title's code is execute-only: RPCS3's fault handler reads instructions from a copy
+ 	rpcs3ps5_load_text_mirror("/app0/rpcs3ps5-text.bin");
+ 
++	g_main_owner = pthread_self();
+ 	create_callbacks();
+ 	// What main_application learns by probing (Qt's render_creator): on the console it is known.
+ 	// Without it RPCS3 resets the renderer to Null at every boot (fixup_settings), and the game
+@@ -959,6 +1021,7 @@ void start_watchdog()
+ 					sys_log.notice("PS5 TIMING: guest/host %.3f, vblank %.1f/s", guest_ratio, vblank_hz);
+ 				}
+ 				sys_log.notice("PS5 CPU: %s", ps5_thread_cpu_report(window_ms * 1'000'000, 14));
++				sys_log.notice("PS5 GUEST: %s", ps5_busy_guest_pcs());
+ 				ps5_hot_spu_rebalance(rpcs3ps5_tune(7)); // PS5_TUNE_SPU_HOT_CPU
+ 				sys_log.notice("PS5 JIT verify: %llu failures", static_cast<unsigned long long>(rpcs3ps5_jit_verify_failures()));
+ 				sys_log.notice("PS5 NARROW CHECK: %llu mismatches", static_cast<unsigned long long>(rpcs3ps5_narrow_ls_check_failures()));
+@@ -1002,14 +1065,11 @@ void start_watchdog()
+ 						(vw - lvw) * 1000 / window_ms, vk_spin_ms, (vsl - lvsl) * 1000 / window_ms);
+ 					lrw = rw; lrs = rs; lrsl = rsl; lrwt = rwt; lvw = vw; lvs = vs; lvsl = vsl;
+ 				}
+-				// Where the busiest threads spend their time: 2 s of samples every ~8 s, cycling through the top 4
++				// Where the busiest thread spends its time: 2 s of samples every ~8 s.
+ 				// ("sys@addr" = inside libkernel/system code, called from addr)
+ 				if (++cpu_reports % 2 == 0)
+ 				{
+-					// Every 5th slot is the RSX thread explicitly (affinity/contention experiment); the rest
+-					// are the busiest threads.
+-					const u64 slot = (cpu_reports / 2) % 5;
+-					const std::string name = slot == 4 ? std::string("rsx::thread") : ps5_thread_top_name(slot);
++					const std::string name = ps5_thread_top_name(0);
+ 					if (!name.empty())
+ 						sys_log.notice("PS5 PROFILE %s: %s", name, ps5_thread_profile(name, 400));
+ 				}
+@@ -1048,6 +1108,7 @@ extern "C" int rpcs3ps5_run(const char* path)
+ 	host_progress(fmt::format("Booting %s", path));
+ 	sys_log.always()("PS5: booting %s", path);
+ 
++	g_main_owner = pthread_self();
+ 	start_watchdog();
+ 	const game_boot_result result = Emu.BootGame(path, "", false, cfg_mode::custom);
+ 	g_main_heartbeat = now_ms();
+-- 
+2.43.0
+

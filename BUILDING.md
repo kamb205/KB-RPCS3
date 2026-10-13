@@ -36,7 +36,7 @@ dependency folder; `port/rpcs3-build.sh` shows the exact paths it expects.
 port/apply-rpcs3-patches.sh /path/to/rpcs3
 ```
 
-This clones upstream RPCS3, checks out `46aee28f8`, initialises the submodules and applies the 47
+This clones upstream RPCS3, checks out `46aee28f8`, initialises the submodules and applies the 48
 patches with `git am --keep-cr`. The `--keep-cr` is required: some upstream files use CRLF line endings.
 
 ## 3. Build the emulator core
