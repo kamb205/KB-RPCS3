@@ -181,7 +181,7 @@ machine:
 | **The PS5 title shell** (home screen, settings, installers, platform glue) | `app/` | mixed — MIT base, GPL-3.0-or-later UI and title code (`app/LICENSING.md`) |
 
 ```bash
-# 1. Fetch and patch upstream RPCS3 (revision 46aee28f8, 47 patches)
+# 1. Fetch and patch upstream RPCS3 (revision 46aee28f8, 48 patches)
 port/apply-rpcs3-patches.sh /path/to/rpcs3
 
 # 2. Build the emulator core (about two hours on 8 cores)
