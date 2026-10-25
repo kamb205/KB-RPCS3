@@ -36,8 +36,17 @@ dependency folder; `port/rpcs3-build.sh` shows the exact paths it expects.
 port/apply-rpcs3-patches.sh /path/to/rpcs3
 ```
 
-This clones upstream RPCS3, checks out `46aee28f8`, initialises the submodules and applies the 47
+This clones upstream RPCS3, checks out `46aee28f8`, initialises the submodules and applies the 48
 patches with `git am --keep-cr`. The `--keep-cr` is required: some upstream files use CRLF line endings.
+
+Check installed-game path handling after applying the series (Python 3 and a C++17 compiler):
+
+```bash
+python3 port/tests/test-hdd0-game-path.py /path/to/rpcs3
+```
+
+This compiles the path expressions from the patched `System.cpp` and checks that resolved roots with
+or without a trailing slash preserve the full title ID. It does not build or run the PS5 emulator.
 
 ## 3. Build the emulator core
 

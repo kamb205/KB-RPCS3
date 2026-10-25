@@ -1,0 +1,28 @@
+From 8b7bb1cd1783bfefd722e6be7a8f1051f53764a4 Mon Sep 17 00:00:00 2001
+From: KB <kb@kb-rpcs3.example>
+Date: Fri, 23 Oct 2026 10:59:34 +0400
+Subject: [PATCH 48/48] PS5: Normalize resolved HDD0 game path
+
+The PS5 path resolver preserves the trailing slash in hdd0_game. Avoid appending a second slash before slicing the title path, which drops the first character of the game directory name.
+---
+ rpcs3/Emu/System.cpp | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/rpcs3/Emu/System.cpp b/rpcs3/Emu/System.cpp
+index b1b5b86..c424964 100644
+--- a/rpcs3/Emu/System.cpp
++++ b/rpcs3/Emu/System.cpp
+@@ -2655,7 +2655,9 @@ game_boot_result Emulator::Load(const std::string& title_id, bool is_disc_patch,
+ 					return fmt::merge(result, "/");
+ 				};
+ 
+-				const std::string resolved_hdd0 = g_emu_callbacks.resolve_path(hdd0_game) + '/';
++				std::string resolved_hdd0 = g_emu_callbacks.resolve_path(hdd0_game);
++				if (resolved_hdd0.empty() || resolved_hdd0.back() != '/')
++					resolved_hdd0 += '/';
+ 
+ 				if (from_hdd0_game && m_cat == "DG")
+ 				{
+-- 
+2.54.0 (Apple Git-157)
+
