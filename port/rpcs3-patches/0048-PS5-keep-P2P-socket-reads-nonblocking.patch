@@ -1,0 +1,54 @@
+From 00011c9df18651c7d8ac1fe9783122f0f4b6b08e Mon Sep 17 00:00:00 2001
+From: DelChris <christopher.delplang@gmail.com>
+Date: Fri, 13 Nov 2026 18:17:01 +0100
+Subject: [PATCH] PS5: keep P2P socket reads nonblocking
+
+---
+ rpcs3/Emu/Cell/lv2/sys_net/network_context.cpp |  4 ++++
+ rpcs3/Emu/Cell/lv2/sys_net/nt_p2p_port.cpp     | 15 ++++++++++++++-
+ 2 files changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/rpcs3/Emu/Cell/lv2/sys_net/network_context.cpp b/rpcs3/Emu/Cell/lv2/sys_net/network_context.cpp
+index 37715cb..c2208ab 100644
+--- a/rpcs3/Emu/Cell/lv2/sys_net/network_context.cpp
++++ b/rpcs3/Emu/Cell/lv2/sys_net/network_context.cpp
+@@ -324,6 +324,10 @@ void p2p_thread::operator()()
+ 		}
+ 		else if (ret_p2p < 0)
+ 		{
++#ifdef __PROSPERO__
++			if (errno == EINTR)
++				continue;
++#endif
+ 			sys_net.error("[P2P] Error poll on master P2P socket: %d", get_last_error(false));
+ 		}
+ 	}
+diff --git a/rpcs3/Emu/Cell/lv2/sys_net/nt_p2p_port.cpp b/rpcs3/Emu/Cell/lv2/sys_net/nt_p2p_port.cpp
+index f3dd7c0..6352278 100644
+--- a/rpcs3/Emu/Cell/lv2/sys_net/nt_p2p_port.cpp
++++ b/rpcs3/Emu/Cell/lv2/sys_net/nt_p2p_port.cpp
+@@ -157,7 +157,20 @@ bool nt_p2p_port::recv_data()
+ {
+ 	::sockaddr_storage native_addr{};
+ 	::socklen_t native_addrlen = sizeof(native_addr);
+-	const auto recv_res = ::recvfrom(p2p_socket, reinterpret_cast<char*>(p2p_recv_data.data()), ::size32(p2p_recv_data), 0, reinterpret_cast<struct sockaddr*>(&native_addr), &native_addrlen);
++#ifdef __PROSPERO__
++	// Avoid draining an empty socket while holding the P2P loop lock.
++	::pollfd ready{p2p_socket, POLLIN, 0};
++	if (::poll(&ready, 1, 0) <= 0 || !(ready.revents & (POLLIN | POLLRDNORM)))
++		return false;
++	constexpr int receive_flags = MSG_DONTWAIT;
++#else
++	constexpr int receive_flags = 0;
++#endif
++	const auto recv_res = ::recvfrom(p2p_socket, reinterpret_cast<char*>(p2p_recv_data.data()), ::size32(p2p_recv_data), receive_flags, reinterpret_cast<struct sockaddr*>(&native_addr), &native_addrlen);
++#ifdef __PROSPERO__
++	if (recv_res < 0 && errno == EINTR)
++		return false;
++#endif
+ 
+ 	if (recv_res == -1)
+ 	{
+-- 
+2.47.1.windows.1
+
