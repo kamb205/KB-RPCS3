@@ -1,0 +1,46 @@
+From e1f7d67c3a1b5670e78f5dc1758a64c5f23f4a17 Mon Sep 17 00:00:00 2001
+From: DelChris <christopher.delplang@gmail.com>
+Date: Fri, 13 Nov 2026 18:16:59 +0100
+Subject: [PATCH] PS5: use the platform RNG for sys_ss
+
+---
+ rpcs3/Emu/Cell/lv2/sys_ss.cpp | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/rpcs3/Emu/Cell/lv2/sys_ss.cpp b/rpcs3/Emu/Cell/lv2/sys_ss.cpp
+index d59a6de..ad806fa 100644
+--- a/rpcs3/Emu/Cell/lv2/sys_ss.cpp
++++ b/rpcs3/Emu/Cell/lv2/sys_ss.cpp
+@@ -15,6 +15,10 @@
+ #ifdef _WIN32
+ #include <Windows.h>
+ #include <bcrypt.h>
++#elif defined(__PROSPERO__)
++#include <algorithm>
++#include <sys/types.h>
++#include <sys/sysctl.h>
+ #endif
+ 
+ struct lv2_update_manager
+@@ -142,6 +146,18 @@ error_code sys_ss_random_number_generator(u64 pkg_id, vm::ptr<void> buf, u64 siz
+ 	{
+ 		fmt::throw_exception("sys_ss_random_number_generator(): BCryptGenRandom failed (0x%08x)", ret);
+ 	}
++#elif defined(__PROSPERO__)
++	// The PS5 title cannot read /dev/urandom.
++	for (usz offset = 0; offset < size;)
++	{
++		size_t count = std::min<usz>(size - offset, 256);
++		const size_t requested = count;
++		if (sysctlbyname("kern.rng_pseudo", temp.get() + offset, &count, nullptr, 0) != 0 || count != requested)
++		{
++			fmt::throw_exception("sys_ss_random_number_generator(): PS5 random generation failed");
++		}
++		offset += count;
++	}
+ #else
+ 	fs::file rnd{"/dev/urandom"};
+ 
+-- 
+2.47.1.windows.1
+
